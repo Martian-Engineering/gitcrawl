@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.8.3 - Unreleased
+## 0.8.3 - 2026-07-20
+
+### Highlights
+
+- Close the wave-5 archive data-loss class: partial child responses no longer erase retained pull-request history, and local writes to portable runtime mirrors now survive later commands.
+
+### Archive integrity
 
 - Preserve comments, pull-request reviews, review threads, and commit references as explicit tombstones; comments and review threads retain edit history, and child hydration now merges by identity so only a sourced deletion event deletes an item while a later live observation restores it.
 - Preserve migrated writable runtime mirrors across portable-store commands, validate their SQLite health independently from the immutable source manifest, and report compatible schema-v4 portable sources as current.
