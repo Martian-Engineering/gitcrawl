@@ -3551,8 +3551,12 @@ func TestWritableRuntimeUsesPortableMirror(t *testing.T) {
 		t.Fatalf("git init: %v", err)
 	}
 	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable issue")
+	prunePortableTestStore(t, filepath.Join(remoteDir, dbRel))
 	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
 		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "add", portableDBManifestPath(filepath.Join(remoteDir, dbRel))); err != nil {
+		t.Fatalf("git add seed manifest: %v", err)
 	}
 	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
 		t.Fatalf("git commit seed: %v", err)
@@ -3606,6 +3610,42 @@ func TestWritableRuntimeUsesPortableMirror(t *testing.T) {
 	if !gitWorktreeClean(ctx, checkoutDir) {
 		t.Fatal("portable checkout should stay clean after writable runtime command")
 	}
+	statePath := portableStoreRefreshStatePath(rt.Config.DBPath)
+	legacyState := readPortableStoreRefreshState(statePath)
+	if legacyState.MirrorHealthSourceSHA256 == "" {
+		t.Fatal("portable refresh state should start with a source hash")
+	}
+	legacyState.MirrorHealthSourceSHA256 = ""
+	if err := writePortableStoreRefreshState(statePath, legacyState); err != nil {
+		t.Fatalf("write legacy portable refresh state: %v", err)
+	}
+
+	legacyRead := New()
+	legacyRead.configPath = configPath
+	legacyRT, err := legacyRead.openLocalRuntimeReadOnly(ctx)
+	if err != nil {
+		t.Fatalf("open runtime with legacy refresh state: %v", err)
+	}
+	if _, _, err := legacyRT.Store.ThreadVectorByNumber(ctx, store.ThreadVectorQuery{
+		RepoID:     repo.ID,
+		Model:      "text-embedding-3-small",
+		Basis:      "title_original",
+		Dimensions: 3,
+	}, 1); err != nil {
+		t.Fatalf("read runtime vector after legacy state migration: %v", err)
+	}
+	if err := legacyRT.Store.Close(); err != nil {
+		t.Fatalf("close runtime after legacy state migration: %v", err)
+	}
+	if got := readPortableStoreRefreshState(statePath).MirrorHealthSourceSHA256; got == "" {
+		t.Fatal("legacy portable refresh state source hash was not migrated")
+	}
+
+	manifestPath := portableDBManifestPath(filepath.Join(checkoutDir, dbRel))
+	manifestTime := time.Now().Add(time.Hour)
+	if err := os.Chtimes(manifestPath, manifestTime, manifestTime); err != nil {
+		t.Fatalf("rewrite portable manifest metadata: %v", err)
+	}
 
 	read := New()
 	read.configPath = configPath
@@ -3613,7 +3653,6 @@ func TestWritableRuntimeUsesPortableMirror(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open read-only runtime: %v", err)
 	}
-	defer readRT.Store.Close()
 	if _, _, err := readRT.Store.ThreadVectorByNumber(ctx, store.ThreadVectorQuery{
 		RepoID:     repo.ID,
 		Model:      "text-embedding-3-small",
@@ -3621,6 +3660,24 @@ func TestWritableRuntimeUsesPortableMirror(t *testing.T) {
 		Dimensions: 3,
 	}, 1); err != nil {
 		t.Fatalf("read runtime vector: %v", err)
+	}
+	if err := readRT.Store.Close(); err != nil {
+		t.Fatalf("close read-only runtime: %v", err)
+	}
+
+	doctorPayload := runDoctorJSON(t, ctx, configPath)
+	if got := doctorMap(t, doctorPayload, "db_schema")["state"]; got != "current" {
+		t.Fatalf("db_schema.state = %#v, payload=%#v", got, doctorPayload)
+	}
+	if got := doctorMap(t, doctorPayload, "runtime_db_health")["health"]; got != "ok" {
+		t.Fatalf("runtime_db_health.health = %#v, payload=%#v", got, doctorPayload)
+	}
+	sourceSchema := doctorMap(t, doctorPayload, "source_db_schema")
+	if got := sourceSchema["state"]; got != "current" {
+		t.Fatalf("source_db_schema.state = %#v, payload=%#v", got, doctorPayload)
+	}
+	if got := sourceSchema["portable"]; got != true {
+		t.Fatalf("source_db_schema.portable = %#v, payload=%#v", got, doctorPayload)
 	}
 }
 
@@ -4025,6 +4082,28 @@ func seedPortableThread(t *testing.T, dbPath string, number int, title string) {
 	}
 	if err := st.Close(); err != nil {
 		t.Fatalf("close portable db: %v", err)
+	}
+}
+
+func prunePortableTestStore(t *testing.T, dbPath string) {
+	t.Helper()
+	ctx := context.Background()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open portable store for prune: %v", err)
+	}
+	stats, err := st.PrunePortablePayloads(ctx, store.PortablePruneOptions{
+		BodyChars: 256,
+		Vacuum:    false,
+	})
+	if closeErr := st.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("prune portable test store: %v", err)
+	}
+	if _, _, err := writePortableDBManifest(stats); err != nil {
+		t.Fatalf("write portable test manifest: %v", err)
 	}
 }
 
