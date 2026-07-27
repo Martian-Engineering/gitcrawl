@@ -3536,6 +3536,27 @@ func TestPortableRuntimeServesHealthyMirrorWhenSourceUnrecoverable(t *testing.T)
 	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
 		t.Fatalf("mirror should remain healthy: %v", err)
 	}
+
+	countBackups := func() int {
+		entries, err := os.ReadDir(filepath.Join(dir, "backups"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return 0
+			}
+			t.Fatalf("read backups dir: %v", err)
+		}
+		return len(entries)
+	}
+	backupsAfterFirst := countBackups()
+	if backupsAfterFirst == 0 {
+		t.Fatal("first recovery attempt should have run repair/reclone")
+	}
+	if changed, err := refreshPortableRuntimeDB(ctx, checkoutDB, mirrorPath, false, filepath.Join(dir, "config.toml")); err != nil || changed {
+		t.Fatalf("backed-off retry should serve the mirror quietly, changed=%v err=%v", changed, err)
+	}
+	if got := countBackups(); got != backupsAfterFirst {
+		t.Fatalf("recovery must back off instead of repeating per read: backups %d -> %d", backupsAfterFirst, got)
+	}
 }
 
 func TestPortableRuntimeRejectsManifestMismatchBeforeReplacingMirror(t *testing.T) {

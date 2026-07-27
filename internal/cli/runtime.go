@@ -47,6 +47,7 @@ const portableStoreRepairTimeout = 90 * time.Second
 const portableStoreRefreshTTL = 2 * time.Minute
 const portableStoreRefreshFailureBackoff = time.Minute
 const portableRuntimeTempMaxAge = time.Hour
+const portableSourceRecoveryBackoff = 15 * time.Minute
 const portableStoreMarkerFile = "gitcrawl-portable-store"
 const staleGitIndexLockAge = 2 * time.Second
 
@@ -289,10 +290,18 @@ func refreshPortableRuntimeDB(ctx context.Context, sourceDBPath, mirrorPath stri
 		}
 		// A recovered source is preferred, but any failure along the
 		// repair/reclone chain degrades to serving a healthy mirror so a
-		// missing source cannot take reads down.
-		recoverErr := recoverMissingPortableSource(ctx, sourceDBPath, configPath, statePath)
-		if recoverErr == nil {
-			needsCopy, recoverErr = portableRuntimeNeedsCopy(sourceDBPath, mirrorPath)
+		// missing source cannot take reads down. Recovery runs reset/pull and
+		// potentially a full reclone, so attempts are backed off via the
+		// recorded repair timestamp instead of repeating on every read. The
+		// backoff only gates this stat-failure branch: an externally restored
+		// source makes the stat succeed and skips the gate entirely.
+		recoverErr := err
+		state := readPortableStoreRefreshState(statePath)
+		if !recentPortableRefresh(state.LastRepairAt, time.Now().UTC(), portableSourceRecoveryBackoff) {
+			recoverErr = recoverMissingPortableSource(ctx, sourceDBPath, configPath, statePath)
+			if recoverErr == nil {
+				needsCopy, recoverErr = portableRuntimeNeedsCopy(sourceDBPath, mirrorPath)
+			}
 		}
 		if recoverErr != nil {
 			if mirrorHealthErr := sqliteStoreHealth(ctx, mirrorPath); mirrorHealthErr == nil {
