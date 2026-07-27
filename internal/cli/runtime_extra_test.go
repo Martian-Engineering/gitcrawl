@@ -1,13 +1,295 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/openclaw/gitcrawl/internal/config"
 )
+
+func TestLocalRuntimeDBTarget(t *testing.T) {
+	direct := localRuntime{Config: config.Config{DBPath: "/data/gitcrawl.db"}}
+	if got, want := direct.dbTarget(), (dbTargetInfo{DBTarget: "direct", DBTargetPath: "/data/gitcrawl.db"}); got != want {
+		t.Fatalf("direct db target = %+v, want %+v", got, want)
+	}
+
+	redirected := localRuntime{
+		Config:       config.Config{DBPath: "/runtime/store/data/gitcrawl.db"},
+		SourceDBPath: "/checkout/data/gitcrawl.db",
+		RemoteSource: true,
+	}
+	want := dbTargetInfo{
+		DBTarget:         "runtime-mirror",
+		DBTargetPath:     "/runtime/store/data/gitcrawl.db",
+		PortableSourceDB: "/checkout/data/gitcrawl.db",
+	}
+	if got := redirected.dbTarget(); got != want {
+		t.Fatalf("redirected db target = %+v, want %+v", got, want)
+	}
+}
+
+func TestSweepOrphanPortableRuntimeTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	mirrorPath := filepath.Join(dir, "x.db")
+	old := time.Now().Add(-2 * portableRuntimeTempMaxAge)
+	oldMatching := []string{".x.db.tmp-123", ".x.db.tmp-123-wal", ".x.db.tmp-123-shm"}
+	oldPreserved := []string{"old.db", ".other.db.tmp-9", ".notes.tmp-backup"}
+	for _, name := range append(append([]string(nil), oldMatching...), oldPreserved...) {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(name), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatalf("backdate %s: %v", name, err)
+		}
+	}
+	fresh := filepath.Join(dir, ".x.db.tmp-fresh")
+	if err := os.WriteFile(fresh, []byte("fresh"), 0o600); err != nil {
+		t.Fatalf("write fresh temp: %v", err)
+	}
+
+	sweepOrphanPortableRuntimeTempFiles(mirrorPath, portableRuntimeTempMaxAge)
+
+	for _, name := range oldMatching {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("old matching temp %s still exists: %v", name, err)
+		}
+	}
+	preserved := []string{fresh}
+	for _, name := range oldPreserved {
+		preserved = append(preserved, filepath.Join(dir, name))
+	}
+	for _, path := range preserved {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("preserved file %s: %v", path, err)
+		}
+	}
+}
+
+func TestCopySQLiteFileAtomicVerifiedRemovesTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.db")
+	target := filepath.Join(dir, "target.db")
+	seedPortableThread(t, source, 1, "copy temp cleanup")
+	if err := copySQLiteFileAtomicVerified(context.Background(), source, target); err != nil {
+		t.Fatalf("copy verified sqlite file: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".target.db.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob temp files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("verified copy left temp files: %v", matches)
+	}
+	invalidSource := filepath.Join(dir, "invalid.db")
+	failedTarget := filepath.Join(dir, "failed.db")
+	if err := os.WriteFile(invalidSource, []byte("not sqlite"), 0o600); err != nil {
+		t.Fatalf("write invalid source: %v", err)
+	}
+	if err := copySQLiteFileAtomicVerified(context.Background(), invalidSource, failedTarget); err == nil {
+		t.Fatal("invalid sqlite source should fail validation")
+	}
+	matches, err = filepath.Glob(filepath.Join(dir, ".failed.db.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob failed-copy temp files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("failed verified copy left temp files: %v", matches)
+	}
+
+	tempPath := filepath.Join(dir, ".failed.db.tmp-123")
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(tempPath+suffix, []byte("sidecar"), 0o600); err != nil {
+			t.Fatalf("write temp sidecar: %v", err)
+		}
+	}
+	removeSQLiteTempSidecars(tempPath)
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(tempPath + suffix); !os.IsNotExist(err) {
+			t.Fatalf("temp sidecar %s still exists: %v", suffix, err)
+		}
+	}
+}
+
+func writeTestPortableManifest(t *testing.T, dbPath string) string {
+	t.Helper()
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat db for manifest: %v", err)
+	}
+	sum, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatalf("hash db for manifest: %v", err)
+	}
+	manifest := portableDBManifest{
+		Schema:      "gitcrawl-portable-sync-v2",
+		ExportedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+		OutputPath:  filepath.Base(dbPath),
+		OutputBytes: info.Size(),
+		SHA256:      fmt.Sprintf("%x", sum),
+		QuickCheck:  "ok",
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	manifestPath := portableDBManifestPath(dbPath)
+	if err := os.WriteFile(manifestPath, data, 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	return manifestPath
+}
+
+func TestPublishPortableCheckoutPairPreservesCheckoutMode(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	mirrorDB := filepath.Join(dir, "mirror", "x.db")
+	checkoutDB := filepath.Join(dir, "checkout", "x.db")
+	seedPortableThread(t, mirrorDB, 1, "publish pair source")
+	mirrorManifest := writeTestPortableManifest(t, mirrorDB)
+	seedPortableThread(t, checkoutDB, 2, "old checkout content")
+	if err := os.Chmod(checkoutDB, 0o600); err != nil {
+		t.Fatalf("chmod checkout db: %v", err)
+	}
+	checkoutManifest := portableDBManifestPath(checkoutDB)
+	if err := os.WriteFile(checkoutManifest, []byte("old manifest"), 0o640); err != nil {
+		t.Fatalf("write old checkout manifest: %v", err)
+	}
+
+	if err := publishPortableCheckoutPair(ctx, mirrorDB, mirrorManifest, checkoutDB, checkoutManifest); err != nil {
+		t.Fatalf("publish portable checkout pair: %v", err)
+	}
+	want, err := os.ReadFile(mirrorDB)
+	if err != nil {
+		t.Fatalf("read mirror db: %v", err)
+	}
+	got, err := os.ReadFile(checkoutDB)
+	if err != nil {
+		t.Fatalf("read published checkout db: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("published checkout db does not match mirror db")
+	}
+	for path, want := range map[string]os.FileMode{checkoutDB: 0o600, checkoutManifest: 0o640} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat published file %s: %v", path, err)
+		}
+		if info.Mode().Perm() != want {
+			t.Fatalf("published file %s mode = %o, want the preserved %o", path, info.Mode().Perm(), want)
+		}
+	}
+	for _, pattern := range []string{".*.tmp-*", ".*.publish-rollback-*"} {
+		leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(checkoutDB), pattern))
+		if err != nil {
+			t.Fatalf("glob %s leftovers: %v", pattern, err)
+		}
+		if len(leftovers) != 0 {
+			t.Fatalf("publish left %s files: %v", pattern, leftovers)
+		}
+	}
+}
+
+func TestPublishPortableCheckoutPairKeepsOldPairOnValidationFailure(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	mirrorDB := filepath.Join(dir, "mirror", "x.db")
+	if err := os.MkdirAll(filepath.Dir(mirrorDB), 0o755); err != nil {
+		t.Fatalf("mkdir mirror: %v", err)
+	}
+	if err := os.WriteFile(mirrorDB, []byte("not sqlite"), 0o600); err != nil {
+		t.Fatalf("write corrupt mirror db: %v", err)
+	}
+	mirrorManifest := mirrorDB + ".manifest.json"
+	if err := os.WriteFile(mirrorManifest, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write mirror manifest: %v", err)
+	}
+	checkoutDB := filepath.Join(dir, "checkout", "x.db")
+	seedPortableThread(t, checkoutDB, 1, "existing published content")
+	checkoutManifest := writeTestPortableManifest(t, checkoutDB)
+	beforeDB, err := os.ReadFile(checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db: %v", err)
+	}
+	beforeManifest, err := os.ReadFile(checkoutManifest)
+	if err != nil {
+		t.Fatalf("read checkout manifest: %v", err)
+	}
+
+	if err := publishPortableCheckoutPair(ctx, mirrorDB, mirrorManifest, checkoutDB, checkoutManifest); err == nil {
+		t.Fatal("corrupt mirror db should fail staged validation")
+	}
+	afterDB, err := os.ReadFile(checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db after failure: %v", err)
+	}
+	afterManifest, err := os.ReadFile(checkoutManifest)
+	if err != nil {
+		t.Fatalf("read checkout manifest after failure: %v", err)
+	}
+	if !bytes.Equal(beforeDB, afterDB) || !bytes.Equal(beforeManifest, afterManifest) {
+		t.Fatal("failed publish must leave the previous checkout pair untouched")
+	}
+	leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(checkoutDB), ".*.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob staged temps: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("failed publish left staged temp files: %v", leftovers)
+	}
+}
+
+func TestPublishPortableCheckoutPairRollsBackDBWhenManifestRenameFails(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	mirrorDB := filepath.Join(dir, "mirror", "x.db")
+	seedPortableThread(t, mirrorDB, 1, "new publish content")
+	mirrorManifest := writeTestPortableManifest(t, mirrorDB)
+	checkoutDB := filepath.Join(dir, "checkout", "x.db")
+	seedPortableThread(t, checkoutDB, 2, "old publish content")
+	checkoutManifest := portableDBManifestPath(checkoutDB)
+	// A directory at the manifest destination makes the final rename fail
+	// after the database rename already succeeded.
+	if err := os.MkdirAll(checkoutManifest, 0o755); err != nil {
+		t.Fatalf("mkdir manifest blocker: %v", err)
+	}
+	before, err := os.ReadFile(checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db: %v", err)
+	}
+
+	if err := publishPortableCheckoutPair(ctx, mirrorDB, mirrorManifest, checkoutDB, checkoutManifest); err == nil {
+		t.Fatal("manifest rename onto a directory should fail")
+	}
+	after, err := os.ReadFile(checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db after failed publish: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed manifest rename must roll the checkout db back")
+	}
+	backups, err := filepath.Glob(filepath.Join(filepath.Dir(checkoutDB), ".*.publish-rollback-*"))
+	if err != nil {
+		t.Fatalf("glob rollback backups: %v", err)
+	}
+	if len(backups) != 0 {
+		t.Fatalf("rollback backup should be consumed after a successful restore: %v", backups)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(checkoutDB), ".*.tmp-*"))
+	if err != nil {
+		t.Fatalf("glob staged temps: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("failed publish left staged temp files: %v", leftovers)
+	}
+}
 
 func TestPortableStoreRootPropagatesGitProbeFailure(t *testing.T) {
 	dir := t.TempDir()

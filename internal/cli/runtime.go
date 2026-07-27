@@ -25,10 +25,28 @@ type localRuntime struct {
 	RemoteSource bool
 }
 
+type dbTargetInfo struct {
+	DBTarget         string `json:"db_target,omitempty"`
+	DBTargetPath     string `json:"db_target_path,omitempty"`
+	PortableSourceDB string `json:"portable_source_db,omitempty"`
+}
+
+func (rt localRuntime) dbTarget() dbTargetInfo {
+	if rt.RemoteSource {
+		return dbTargetInfo{
+			DBTarget:         "runtime-mirror",
+			DBTargetPath:     rt.Config.DBPath,
+			PortableSourceDB: rt.SourceDBPath,
+		}
+	}
+	return dbTargetInfo{DBTarget: "direct", DBTargetPath: rt.Config.DBPath}
+}
+
 const portableStoreRefreshTimeout = 15 * time.Second
 const portableStoreRepairTimeout = 90 * time.Second
 const portableStoreRefreshTTL = 2 * time.Minute
 const portableStoreRefreshFailureBackoff = time.Minute
+const portableRuntimeTempMaxAge = time.Hour
 const portableStoreMarkerFile = "gitcrawl-portable-store"
 const staleGitIndexLockAge = 2 * time.Second
 
@@ -53,6 +71,9 @@ func (a *App) openLocalRuntime(ctx context.Context) (localRuntime, error) {
 		}
 		cfg.DBPath = mirrorPath
 		remoteSource = true
+		a.dbTargetNoticeOnce.Do(func() {
+			fmt.Fprintf(a.Stderr, "gitcrawl: portable store checkout detected; writes go to the runtime mirror at %s, not the checkout database %s. Run 'gitcrawl portable prune' to publish.\n", mirrorPath, sourceDBPath)
+		})
 	}
 	st, err := store.Open(ctx, cfg.DBPath)
 	if err != nil {
@@ -244,6 +265,7 @@ func (a *App) portableRuntimeDBPath(ctx context.Context, sourceDBPath string) (s
 func refreshPortableRuntimeDB(ctx context.Context, sourceDBPath, mirrorPath string, refresh bool, configPath string) (bool, error) {
 	portableRuntimeMu.Lock()
 	defer portableRuntimeMu.Unlock()
+	sweepOrphanPortableRuntimeTempFiles(mirrorPath, portableRuntimeTempMaxAge)
 	_, isPortableSource, err := portableStoreRoot(ctx, sourceDBPath)
 	if err != nil {
 		return false, err
@@ -752,76 +774,68 @@ func portableRuntimeNeedsCopy(sourceDBPath, mirrorPath string) (bool, error) {
 }
 
 func copyFileAtomic(sourcePath, targetPath string) error {
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-		return fmt.Errorf("create portable runtime dir: %w", err)
-	}
-	source, err := os.Open(sourcePath)
+	tempPath, err := stageFileCopyTemp(sourcePath, targetPath, 0o600)
 	if err != nil {
-		return fmt.Errorf("open portable source db: %w", err)
-	}
-	defer source.Close()
-	temp, err := os.CreateTemp(filepath.Dir(targetPath), "."+filepath.Base(targetPath)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("create portable runtime temp db: %w", err)
-	}
-	tempPath := temp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if _, err := io.Copy(temp, source); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("copy portable runtime db: %w", err)
-	}
-	if err := temp.Chmod(0o600); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("chmod portable runtime db: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("close portable runtime db: %w", err)
+		return err
 	}
 	if err := os.Rename(tempPath, targetPath); err != nil {
+		_ = os.Remove(tempPath)
+		removeSQLiteTempSidecars(tempPath)
 		return fmt.Errorf("replace portable runtime db: %w", err)
 	}
-	cleanup = false
-	_ = os.Remove(targetPath + "-wal")
-	_ = os.Remove(targetPath + "-shm")
+	removeSQLiteTempSidecars(tempPath)
+	removeSQLiteTempSidecars(targetPath)
 	return nil
 }
 
-func copySQLiteFileAtomicVerified(ctx context.Context, sourcePath, targetPath string) error {
+func stageFileCopyTemp(sourcePath, targetPath string, mode os.FileMode) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-		return fmt.Errorf("create portable runtime dir: %w", err)
+		return "", fmt.Errorf("create portable runtime dir: %w", err)
 	}
 	source, err := os.Open(sourcePath)
 	if err != nil {
-		return fmt.Errorf("open portable source db: %w", err)
+		return "", fmt.Errorf("open portable source db: %w", err)
 	}
 	defer source.Close()
 	temp, err := os.CreateTemp(filepath.Dir(targetPath), "."+filepath.Base(targetPath)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("create portable runtime temp db: %w", err)
+		return "", fmt.Errorf("create portable runtime temp db: %w", err)
 	}
 	tempPath := temp.Name()
 	cleanup := true
 	defer func() {
 		if cleanup {
 			_ = os.Remove(tempPath)
+			removeSQLiteTempSidecars(tempPath)
 		}
 	}()
 	if _, err := io.Copy(temp, source); err != nil {
 		_ = temp.Close()
-		return fmt.Errorf("copy portable runtime db: %w", err)
+		return "", fmt.Errorf("copy portable runtime db: %w", err)
 	}
-	if err := temp.Chmod(0o600); err != nil {
+	if err := temp.Chmod(mode); err != nil {
 		_ = temp.Close()
-		return fmt.Errorf("chmod portable runtime db: %w", err)
+		return "", fmt.Errorf("chmod portable runtime db: %w", err)
 	}
 	if err := temp.Close(); err != nil {
-		return fmt.Errorf("close portable runtime db: %w", err)
+		return "", fmt.Errorf("close portable runtime db: %w", err)
 	}
+	cleanup = false
+	return tempPath, nil
+}
+
+func copySQLiteFileAtomicVerified(ctx context.Context, sourcePath, targetPath string) error {
+	tempPath, err := stageFileCopyTemp(sourcePath, targetPath, 0o600)
+	if err != nil {
+		return err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempPath)
+			removeSQLiteTempSidecars(tempPath)
+		}
+	}()
 	if err := validatePortableSQLiteFile(ctx, tempPath, sourcePath); err != nil {
 		return fmt.Errorf("validate portable runtime temp db: %w", err)
 	}
@@ -829,9 +843,147 @@ func copySQLiteFileAtomicVerified(ctx context.Context, sourcePath, targetPath st
 		return fmt.Errorf("replace portable runtime db: %w", err)
 	}
 	cleanup = false
-	_ = os.Remove(targetPath + "-wal")
-	_ = os.Remove(targetPath + "-shm")
+	removeSQLiteTempSidecars(tempPath)
+	removeSQLiteTempSidecars(targetPath)
 	return nil
+}
+
+// publishPortableCheckoutPair replaces the checkout database and manifest with
+// the pruned mirror pair. Both files are staged and validated inside the
+// checkout before the first rename so a staging or validation failure leaves
+// the previously published pair untouched.
+func publishPortableCheckoutPair(ctx context.Context, mirrorDBPath, mirrorManifestPath, checkoutDBPath, checkoutManifestPath string) error {
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(checkoutDBPath); err == nil {
+		mode = info.Mode().Perm()
+	}
+	manifestMode := mode
+	if info, err := os.Stat(checkoutManifestPath); err == nil {
+		manifestMode = info.Mode().Perm()
+	}
+	tempDB, err := stageFileCopyTemp(mirrorDBPath, checkoutDBPath, mode)
+	if err != nil {
+		return fmt.Errorf("stage published portable db: %w", err)
+	}
+	stagedDB := tempDB
+	defer func() {
+		if tempDB != "" {
+			_ = os.Remove(tempDB)
+		}
+		removeSQLiteTempSidecars(stagedDB)
+	}()
+	tempManifest, err := stageFileCopyTemp(mirrorManifestPath, checkoutManifestPath, manifestMode)
+	if err != nil {
+		return fmt.Errorf("stage published portable manifest: %w", err)
+	}
+	defer func() {
+		if tempManifest != "" {
+			_ = os.Remove(tempManifest)
+		}
+	}()
+	if err := sqliteStoreImmutableHealth(ctx, tempDB); err != nil {
+		return fmt.Errorf("validate staged portable db: %w", err)
+	}
+	if err := validatePortableDBManifest(tempDB, tempManifest); err != nil {
+		return fmt.Errorf("validate staged portable manifest: %w", err)
+	}
+	// The pair is replaced with two adjacent renames; a crash between them is
+	// the same manifest-mismatch state a consumer's interrupted `git pull` can
+	// produce, and manifest validation plus the git-based repair path recover
+	// it. Concurrent publishers are out of contract (see the portable-store
+	// caveats) the same way concurrent `git push` publishers are. A failed
+	// manifest rename rolls the database back from the backup so an error
+	// return leaves a consistent previous pair.
+	rollbackDB := ""
+	if _, err := os.Stat(checkoutDBPath); err == nil {
+		backup, err := stageRollbackBackup(checkoutDBPath)
+		if err != nil {
+			return fmt.Errorf("back up published portable db: %w", err)
+		}
+		rollbackDB = backup
+	}
+	defer func() {
+		if rollbackDB != "" {
+			_ = os.Remove(rollbackDB)
+		}
+	}()
+	if err := os.Rename(tempDB, checkoutDBPath); err != nil {
+		return fmt.Errorf("replace published portable db: %w", err)
+	}
+	tempDB = ""
+	removeSQLiteTempSidecars(checkoutDBPath)
+	if err := os.Rename(tempManifest, checkoutManifestPath); err != nil {
+		if rollbackDB != "" {
+			backupPath := rollbackDB
+			rollbackDB = ""
+			if restoreErr := os.Rename(backupPath, checkoutDBPath); restoreErr != nil {
+				// Keep the backup on disk for manual recovery.
+				return fmt.Errorf("replace published portable manifest: %w; restoring the previous database from %s also failed: %v", err, backupPath, restoreErr)
+			}
+		}
+		return fmt.Errorf("replace published portable manifest: %w", err)
+	}
+	tempManifest = ""
+	return nil
+}
+
+// stageRollbackBackup snapshots path under a unique sibling name, preferring a
+// hard link and falling back to a byte copy on filesystems without link
+// support. The caller owns the returned file.
+func stageRollbackBackup(path string) (string, error) {
+	placeholder, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".publish-rollback-*")
+	if err != nil {
+		return "", err
+	}
+	backupPath := placeholder.Name()
+	if err := placeholder.Close(); err != nil {
+		_ = os.Remove(backupPath)
+		return "", err
+	}
+	if err := os.Remove(backupPath); err != nil {
+		return "", err
+	}
+	if err := os.Link(path, backupPath); err == nil {
+		return backupPath, nil
+	}
+	mode := os.FileMode(0o600)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+	temp, err := stageFileCopyTemp(path, backupPath, mode)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(temp, backupPath); err != nil {
+		_ = os.Remove(temp)
+		removeSQLiteTempSidecars(temp)
+		return "", err
+	}
+	return backupPath, nil
+}
+
+func removeSQLiteTempSidecars(path string) {
+	_ = os.Remove(path + "-wal")
+	_ = os.Remove(path + "-shm")
+}
+
+func sweepOrphanPortableRuntimeTempFiles(mirrorPath string, maxAge time.Duration) {
+	dir := filepath.Dir(mirrorPath)
+	prefix := "." + filepath.Base(mirrorPath) + ".tmp-"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.Type().IsRegular() && strings.HasPrefix(name, prefix) {
+			info, err := entry.Info()
+			if err == nil && info.ModTime().Before(cutoff) {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
+		}
+	}
 }
 
 func portableStoreRoot(ctx context.Context, dbPath string) (string, bool, error) {

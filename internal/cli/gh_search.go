@@ -164,7 +164,7 @@ func (a *App) syncGHSearchIfStale(ctx context.Context, owner, repoName, state st
 	} else {
 		fmt.Fprintf(a.Stderr, "gitcrawl: cached sync for %s/%s is older than %s; syncing before search\n", owner, repoName, maxAge)
 	}
-	_, err = a.syncRepository(ctx, owner, repoName, syncOptions{State: state})
+	_, _, err = a.syncRepository(ctx, owner, repoName, syncOptions{State: state})
 	return err
 }
 
