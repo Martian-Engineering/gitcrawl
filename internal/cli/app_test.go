@@ -3495,6 +3495,49 @@ func TestPortableRuntimeRepairsMissingSourceDB(t *testing.T) {
 	}
 }
 
+func TestPortableRuntimeServesHealthyMirrorWhenSourceUnrecoverable(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	// The remote never contained the database, so repair and reclone both
+	// complete without restoring it; a healthy mirror must keep serving.
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteDir, "data", ".gitkeep"), nil, 0o644); err != nil {
+		t.Fatalf("write gitkeep: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "add", "."); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "empty store"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+
+	checkoutDB := filepath.Join(checkoutDir, dbRel)
+	mirrorPath := filepath.Join(dir, "runtime", dbRel)
+	seedPortableThread(t, mirrorPath, 1, "healthy mirror content")
+
+	changed, err := refreshPortableRuntimeDB(ctx, checkoutDB, mirrorPath, false, filepath.Join(dir, "config.toml"))
+	if err != nil {
+		t.Fatalf("healthy mirror should keep serving when the source is unrecoverable: %v", err)
+	}
+	if changed {
+		t.Fatal("unrecoverable source must not report a refreshed mirror")
+	}
+	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
+		t.Fatalf("mirror should remain healthy: %v", err)
+	}
+}
+
 func TestPortableRuntimeRejectsManifestMismatchBeforeReplacingMirror(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

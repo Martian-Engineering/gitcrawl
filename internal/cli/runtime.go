@@ -287,24 +287,18 @@ func refreshPortableRuntimeDB(ctx context.Context, sourceDBPath, mirrorPath stri
 		if !isRepairablePortableSource || !errors.Is(err, os.ErrNotExist) {
 			return false, err
 		}
-		repair, repairErr := repairMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
-		recordPortableRepairState(statePath, repair, repairErr)
-		if repairErr != nil {
+		// A recovered source is preferred, but any failure along the
+		// repair/reclone chain degrades to serving a healthy mirror so a
+		// missing source cannot take reads down.
+		recoverErr := recoverMissingPortableSource(ctx, sourceDBPath, configPath, statePath)
+		if recoverErr == nil {
+			needsCopy, recoverErr = portableRuntimeNeedsCopy(sourceDBPath, mirrorPath)
+		}
+		if recoverErr != nil {
 			if mirrorHealthErr := sqliteStoreHealth(ctx, mirrorPath); mirrorHealthErr == nil {
 				return false, nil
 			}
-			return false, fmt.Errorf("repair malformed portable store db: %w", repairErr)
-		}
-		if _, statErr := os.Stat(sourceDBPath); errors.Is(statErr, os.ErrNotExist) {
-			reclone, recloneErr := recloneMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
-			recordPortableRepairState(statePath, reclone, recloneErr)
-			if recloneErr != nil {
-				return false, fmt.Errorf("reclone malformed portable store db: %w", recloneErr)
-			}
-		}
-		needsCopy, err = portableRuntimeNeedsCopy(sourceDBPath, mirrorPath)
-		if err != nil {
-			return false, err
+			return false, recoverErr
 		}
 	}
 	mirrorCorrupt := false
@@ -374,6 +368,22 @@ type portableStoreRefreshState struct {
 	LastRepairBackup            string `json:"last_repair_backup,omitempty"`
 	LastRepairAt                string `json:"last_repair_at,omitempty"`
 	LastRepairError             string `json:"last_repair_error,omitempty"`
+}
+
+func recoverMissingPortableSource(ctx context.Context, sourceDBPath, configPath, statePath string) error {
+	repair, err := repairMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
+	recordPortableRepairState(statePath, repair, err)
+	if err != nil {
+		return fmt.Errorf("repair malformed portable store db: %w", err)
+	}
+	if _, statErr := os.Stat(sourceDBPath); errors.Is(statErr, os.ErrNotExist) {
+		reclone, recloneErr := recloneMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
+		recordPortableRepairState(statePath, reclone, recloneErr)
+		if recloneErr != nil {
+			return fmt.Errorf("reclone malformed portable store db: %w", recloneErr)
+		}
+	}
+	return nil
 }
 
 func refreshPortableStoreForDBIfDue(ctx context.Context, sourceDBPath, mirrorPath string) error {
