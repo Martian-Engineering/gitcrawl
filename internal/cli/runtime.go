@@ -47,6 +47,7 @@ const portableStoreRepairTimeout = 90 * time.Second
 const portableStoreRefreshTTL = 2 * time.Minute
 const portableStoreRefreshFailureBackoff = time.Minute
 const portableRuntimeTempMaxAge = time.Hour
+const portableSourceRecoveryBackoff = 15 * time.Minute
 const portableStoreMarkerFile = "gitcrawl-portable-store"
 const staleGitIndexLockAge = 2 * time.Second
 
@@ -136,12 +137,19 @@ func refreshPortableStoreForDB(ctx context.Context, dbPath string) error {
 	if !ok {
 		return nil
 	}
-	if !gitWorktreeClean(ctx, root) {
+	clean := gitWorktreeClean(ctx, root)
+	if !clean {
+		removed, _ := removeStaleGitIndexLock(ctx, root, staleGitIndexLockAge)
+		if removed {
+			clean = gitWorktreeClean(ctx, root)
+		}
+	}
+	if !clean {
 		return errPortableStoreDirty
 	}
 	pullCtx, cancel := context.WithTimeout(ctx, portableStoreRefreshTimeout)
 	defer cancel()
-	if err := fastForwardGitCheckout(pullCtx, root, true); err != nil {
+	if _, err := fastForwardGitCheckoutWithStaleIndexLockRetry(pullCtx, root, true); err != nil {
 		return err
 	}
 	return removePortableSQLiteSidecars(root)
@@ -275,10 +283,33 @@ func refreshPortableRuntimeDB(ctx context.Context, sourceDBPath, mirrorPath stri
 		_ = refreshPortableStoreForDBIfDue(ctx, sourceDBPath, mirrorPath)
 	}
 	needsCopy, err := portableRuntimeNeedsCopy(sourceDBPath, mirrorPath)
-	if err != nil {
-		return false, err
-	}
 	statePath := portableStoreRefreshStatePath(mirrorPath)
+	if err != nil {
+		if !isRepairablePortableSource || !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+		// A recovered source is preferred, but any failure along the
+		// repair/reclone chain degrades to serving a healthy mirror so a
+		// missing source cannot take reads down. Recovery runs reset/pull and
+		// potentially a full reclone, so attempts are backed off via the
+		// recorded repair timestamp instead of repeating on every read. The
+		// backoff only gates this stat-failure branch: an externally restored
+		// source makes the stat succeed and skips the gate entirely.
+		recoverErr := err
+		state := readPortableStoreRefreshState(statePath)
+		if !recentPortableRefresh(state.LastRepairAt, time.Now().UTC(), portableSourceRecoveryBackoff) {
+			recoverErr = recoverMissingPortableSource(ctx, sourceDBPath, configPath, statePath)
+			if recoverErr == nil {
+				needsCopy, recoverErr = portableRuntimeNeedsCopy(sourceDBPath, mirrorPath)
+			}
+		}
+		if recoverErr != nil {
+			if mirrorHealthErr := sqliteStoreHealth(ctx, mirrorPath); mirrorHealthErr == nil {
+				return false, nil
+			}
+			return false, recoverErr
+		}
+	}
 	mirrorCorrupt := false
 	if isRepairablePortableSource && !needsCopy {
 		mirrorHealthErr := portableMirrorCachedHealth(ctx, mirrorPath, sourceDBPath, statePath)
@@ -346,6 +377,22 @@ type portableStoreRefreshState struct {
 	LastRepairBackup            string `json:"last_repair_backup,omitempty"`
 	LastRepairAt                string `json:"last_repair_at,omitempty"`
 	LastRepairError             string `json:"last_repair_error,omitempty"`
+}
+
+func recoverMissingPortableSource(ctx context.Context, sourceDBPath, configPath, statePath string) error {
+	repair, err := repairMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
+	recordPortableRepairState(statePath, repair, err)
+	if err != nil {
+		return fmt.Errorf("repair malformed portable store db: %w", err)
+	}
+	if _, statErr := os.Stat(sourceDBPath); errors.Is(statErr, os.ErrNotExist) {
+		reclone, recloneErr := recloneMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
+		recordPortableRepairState(statePath, reclone, recloneErr)
+		if recloneErr != nil {
+			return fmt.Errorf("reclone malformed portable store db: %w", recloneErr)
+		}
+	}
+	return nil
 }
 
 func refreshPortableStoreForDBIfDue(ctx context.Context, sourceDBPath, mirrorPath string) error {
