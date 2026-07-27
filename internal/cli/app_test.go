@@ -6036,14 +6036,19 @@ func TestFillPRDetailsHydratesMissingPullRequestDetails(t *testing.T) {
 		t.Fatalf("fill-pr-details: %v\nstderr=%s", err, stderr.String())
 	}
 	var result struct {
-		Selected int `json:"selected"`
-		Filled   int `json:"filled"`
+		Selected     int    `json:"selected"`
+		Filled       int    `json:"filled"`
+		DBTarget     string `json:"db_target"`
+		DBTargetPath string `json:"db_target_path"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		t.Fatalf("decode fill result: %v\n%s", err, stdout.String())
 	}
 	if result.Selected != 1 || result.Filled != 1 {
 		t.Fatalf("fill result = %+v", result)
+	}
+	if result.DBTarget != "direct" || result.DBTargetPath != dbPath {
+		t.Fatalf("fill db target = %+v", result)
 	}
 	if !strings.Contains(stderr.String(), `"event":"batch_start"`) || !strings.Contains(stderr.String(), `"event":"batch_done"`) {
 		t.Fatalf("missing json progress events: %s", stderr.String())
