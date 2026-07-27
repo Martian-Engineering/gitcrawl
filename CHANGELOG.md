@@ -2,6 +2,10 @@
 
 ## 0.8.7 - Unreleased
 
+### Portable stores
+
+- Escalate reset-pull repair failures to the reclone fallback with a 15-minute backoff so checkouts with broken Git metadata self-heal instead of requiring manual recovery.
+
 ## 0.8.6 - 2026-07-26
 
 ### Portable stores
