@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.6 - Unreleased
+## 0.8.6 - 2026-07-26
 
 ### Portable stores
 
