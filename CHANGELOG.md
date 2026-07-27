@@ -10,7 +10,7 @@
 
 ### Dependencies and maintenance
 
-- Update `github.com/mattn/go-isatty` to 0.0.24.
+- Update `github.com/mattn/go-isatty` to 0.0.24 and `github.com/mattn/go-runewidth` to 0.0.27.
 
 ## 0.8.4 - 2026-07-22
 
