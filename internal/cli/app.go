@@ -2953,6 +2953,7 @@ type fillPRDetailsResult struct {
 	IncludeComments  bool                 `json:"include_comments,omitempty"`
 	JSONProgress     bool                 `json:"json_progress,omitempty"`
 	ReserveRateLimit int                  `json:"reserve_rate_limit,omitempty"`
+	dbTargetInfo
 }
 
 type fillPRDetailsBatch struct {
@@ -3036,6 +3037,7 @@ func (a *App) runFillPRDetails(ctx context.Context, args []string) error {
 		IncludeComments:  *includeComments,
 		JSONProgress:     *jsonProgress,
 		ReserveRateLimit: reserve,
+		dbTargetInfo:     rt.dbTarget(),
 	}
 	for i := 0; i < len(numbers); i += batchSize {
 		end := i + batchSize

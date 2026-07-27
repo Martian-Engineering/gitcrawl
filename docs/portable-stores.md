@@ -62,7 +62,7 @@ If the remote is unreachable, the read still answers from the local checkout.
 
 Write commands (`sync`, `embed`, `refresh`, `portable prune`, `cluster`, neighbor generation) open a **writable runtime mirror** alongside the portable checkout so new GitHub data, vectors, and overrides persist without partially mutating the published portable store. When this redirect engages, gitcrawl prints one stderr notice naming both the runtime mirror and the checkout database.
 
-JSON output from `sync`, `refresh`, and `portable prune` makes that destination machine-readable: `db_target` is `runtime-mirror`, `db_target_path` names the database actually written, and `portable_source_db` names the database in the checkout. With a non-portable local database, `db_target` is `direct`, `db_target_path` names that database, and `portable_source_db` is omitted.
+JSON output from `sync`, `refresh`, `fill-pr-details`, and `portable prune` makes that destination machine-readable: `db_target` is `runtime-mirror`, `db_target_path` names the database actually written, and `portable_source_db` names the database in the checkout. With a non-portable local database, `db_target` is `direct`, `db_target_path` names that database, and `portable_source_db` is omitted.
 
 This separation means:
 
