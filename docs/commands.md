@@ -135,7 +135,7 @@ octopool gh api repos/openclaw/openclaw/pulls/123
 
 | Command | Purpose | Docs |
 | --- | --- | --- |
-| `gitcrawl portable prune [--body-chars --no-vacuum --include-sync-failures --json]` | Build a compact portable v2 backup and (optionally) `VACUUM` for publishing | [Portable stores](/portable-stores/#publishing-gitcrawl-portable-prune) |
+| `gitcrawl portable prune [--body-chars --no-vacuum --include-sync-failures --no-publish --json]` | Build a compact portable v2 backup and (optionally) `VACUUM` for publishing | [Portable stores](/portable-stores/#publishing-gitcrawl-portable-prune) |
 
 ## Not yet implemented
 

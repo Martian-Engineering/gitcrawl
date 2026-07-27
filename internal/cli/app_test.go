@@ -2564,7 +2564,7 @@ func TestMetadataStatusAndControlStatusJSON(t *testing.T) {
 	if err := help.printCommandUsage("portable"); err != nil {
 		t.Fatalf("portable help: %v", err)
 	}
-	if !strings.Contains(helpOut.String(), "portable") || !strings.Contains(helpOut.String(), "--include-sync-failures") || !strings.Contains(helpOut.String(), "redact") {
+	if !strings.Contains(helpOut.String(), "portable") || !strings.Contains(helpOut.String(), "--include-sync-failures") || !strings.Contains(helpOut.String(), "--no-publish") || !strings.Contains(helpOut.String(), "redact") {
 		t.Fatalf("portable help output = %q", helpOut.String())
 	}
 	helpOut.Reset()
@@ -4361,6 +4361,170 @@ func TestPortablePruneCommand(t *testing.T) {
 	if err := validatePortableSQLiteFile(context.Background(), dbPath, dbPath); err != nil {
 		t.Fatalf("portable prune should leave valid db + manifest: %v", err)
 	}
+	if payload["db_target"] != "direct" || payload["db_target_path"] != dbPath || payload["published"] != false {
+		t.Fatalf("direct portable prune target = %#v", payload)
+	}
+}
+
+type portablePruneTestFixture struct {
+	configPath string
+	checkoutDB string
+	mirrorDB   string
+}
+
+func newPortablePruneTestFixture(t *testing.T) portablePruneTestFixture {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	remoteDB := filepath.Join(remoteDir, dbRel)
+	if err := os.MkdirAll(filepath.Dir(remoteDB), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, remoteDB, 1, strings.Repeat("portable publish payload ", 32))
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+
+	configPath := filepath.Join(dir, "config.toml")
+	initApp := New()
+	initApp.Stdout = io.Discard
+	initApp.Stderr = io.Discard
+	if err := initApp.Run(ctx, []string{
+		"--config", configPath,
+		"init",
+		"--portable-store", remoteDir,
+		"--portable-db", filepath.ToSlash(dbRel),
+		"--store-dir", checkoutDir,
+	}); err != nil {
+		t.Fatalf("init portable store: %v", err)
+	}
+	checkoutDB := filepath.Join(checkoutDir, dbRel)
+	pathApp := New()
+	pathApp.configPath = configPath
+	mirrorDB, err := pathApp.portableRuntimeDBPath(ctx, checkoutDB)
+	if err != nil {
+		t.Fatalf("portable runtime db path: %v", err)
+	}
+	return portablePruneTestFixture{configPath: configPath, checkoutDB: checkoutDB, mirrorDB: mirrorDB}
+}
+
+func TestPortablePrunePublishesRuntimeMirrorToCheckout(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortablePruneTestFixture(t)
+	if err := os.Chmod(fixture.checkoutDB, 0o600); err != nil {
+		t.Fatalf("restrict checkout db mode: %v", err)
+	}
+	before, err := os.ReadFile(fixture.checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db before prune: %v", err)
+	}
+	app := New()
+	var stdout, stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+	if err := app.Run(ctx, []string{"--config", fixture.configPath, "portable", "prune", "--json"}); err != nil {
+		t.Fatalf("portable prune: %v\nstderr:\n%s", err, stderr.String())
+	}
+	var payload struct {
+		DBTarget              string `json:"db_target"`
+		DBTargetPath          string `json:"db_target_path"`
+		PortableSourceDB      string `json:"portable_source_db"`
+		Published             bool   `json:"published"`
+		PublishedDBPath       string `json:"published_db_path"`
+		PublishedManifestPath string `json:"published_manifest_path"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("parse portable prune json: %v\n%s", err, stdout.String())
+	}
+	if payload.DBTarget != "runtime-mirror" || payload.DBTargetPath != fixture.mirrorDB || payload.PortableSourceDB != fixture.checkoutDB {
+		t.Fatalf("portable prune target = %+v, mirror=%s source=%s", payload, fixture.mirrorDB, fixture.checkoutDB)
+	}
+	wantManifest := portableDBManifestPath(fixture.checkoutDB)
+	if !payload.Published || payload.PublishedDBPath != fixture.checkoutDB || payload.PublishedManifestPath != wantManifest {
+		t.Fatalf("portable prune publish result = %+v", payload)
+	}
+	after, err := os.ReadFile(fixture.checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db after prune: %v", err)
+	}
+	if bytes.Equal(after, before) {
+		t.Fatal("published checkout database bytes did not change")
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(fixture.checkoutDB + suffix); !os.IsNotExist(err) {
+			t.Fatalf("published checkout sidecar %s still exists: %v", suffix, err)
+		}
+	}
+	if err := validatePortableSQLiteSourceFile(ctx, fixture.checkoutDB, fixture.checkoutDB); err != nil {
+		t.Fatalf("validate published checkout db: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(fixture.checkoutDB + suffix); !os.IsNotExist(err) {
+			t.Fatalf("checkout sidecar %s exists after validation: %v", suffix, err)
+		}
+	}
+	for _, path := range []string{fixture.checkoutDB, wantManifest} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat published file %s: %v", path, err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("published file %s mode = %o, want the preserved 600", path, info.Mode().Perm())
+		}
+	}
+	wantNotice := fmt.Sprintf("gitcrawl: portable store checkout detected; writes go to the runtime mirror at %s, not the checkout database %s. Run 'gitcrawl portable prune' to publish.", fixture.mirrorDB, fixture.checkoutDB)
+	if strings.Count(stderr.String(), wantNotice) != 1 {
+		t.Fatalf("redirect notice count = %d, want 1\nstderr:\n%s", strings.Count(stderr.String(), wantNotice), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "published pruned database to "+fixture.checkoutDB) || !strings.Contains(stderr.String(), wantManifest) {
+		t.Fatalf("publish notice missing paths:\n%s", stderr.String())
+	}
+	t.Logf("portable prune JSON: %s", strings.TrimSpace(stdout.String()))
+}
+
+func TestPortablePruneNoPublishLeavesCheckoutUnchanged(t *testing.T) {
+	fixture := newPortablePruneTestFixture(t)
+	before, err := os.ReadFile(fixture.checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db before prune: %v", err)
+	}
+	app := New()
+	var stdout, stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+	if err := app.Run(context.Background(), []string{"--config", fixture.configPath, "portable", "prune", "--no-publish", "--json"}); err != nil {
+		t.Fatalf("portable prune --no-publish: %v\nstderr:\n%s", err, stderr.String())
+	}
+	var payload struct {
+		Published             bool   `json:"published"`
+		PublishedDBPath       string `json:"published_db_path"`
+		PublishedManifestPath string `json:"published_manifest_path"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("parse portable prune json: %v\n%s", err, stdout.String())
+	}
+	if payload.Published || payload.PublishedDBPath != "" || payload.PublishedManifestPath != "" {
+		t.Fatalf("no-publish result = %+v", payload)
+	}
+	after, err := os.ReadFile(fixture.checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db after prune: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("--no-publish changed checkout database bytes")
+	}
+	if _, err := os.Stat(portableDBManifestPath(fixture.checkoutDB)); !os.IsNotExist(err) {
+		t.Fatalf("--no-publish wrote checkout manifest: %v", err)
+	}
 }
 
 func TestPortablePruneCommandCanIncludeRedactedSyncFailures(t *testing.T) {
@@ -5736,15 +5900,20 @@ func TestSyncCommandUsesConfiguredGitHubBaseURLAndHydratesComments(t *testing.T)
 		t.Fatalf("sync: %v", err)
 	}
 	var stats struct {
-		ThreadsSynced      int `json:"threads_synced"`
-		PullRequestsSynced int `json:"pull_requests_synced"`
-		CommentsSynced     int `json:"comments_synced"`
+		ThreadsSynced      int    `json:"threads_synced"`
+		PullRequestsSynced int    `json:"pull_requests_synced"`
+		CommentsSynced     int    `json:"comments_synced"`
+		DBTarget           string `json:"db_target"`
+		DBTargetPath       string `json:"db_target_path"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &stats); err != nil {
 		t.Fatalf("decode sync stats: %v\n%s", err, stdout.String())
 	}
 	if stats.ThreadsSynced != 2 || stats.PullRequestsSynced != 1 || stats.CommentsSynced != 4 {
 		t.Fatalf("sync stats = %+v", stats)
+	}
+	if stats.DBTarget != "direct" || stats.DBTargetPath != dbPath {
+		t.Fatalf("sync db target = %+v", stats)
 	}
 
 	st, err := store.Open(ctx, dbPath)
@@ -6262,6 +6431,9 @@ func TestRefreshRunsSyncEmbedAndClusterWithLocalServers(t *testing.T) {
 	}
 	if payload.Cluster == nil || int(payload.Cluster["vector_count"].(float64)) != 2 {
 		t.Fatalf("cluster payload = %+v", payload.Cluster)
+	}
+	if payload.DBTarget != "direct" || payload.DBTargetPath != dbPath {
+		t.Fatalf("refresh db target = %+v", payload.dbTargetInfo)
 	}
 	for _, want := range []string{"[refresh] sync", "[refresh] embed", "[refresh] cluster"} {
 		if !strings.Contains(stderr.String(), want) {
@@ -8439,6 +8611,13 @@ func TestRefreshEmbedsAndClustersWithoutSync(t *testing.T) {
 	}
 	if !strings.Contains(out, `"cluster_count": 2`) {
 		t.Fatalf("refresh did not persist cluster: %q", out)
+	}
+	var target dbTargetInfo
+	if err := json.Unmarshal(stdout.Bytes(), &target); err != nil {
+		t.Fatalf("decode refresh db target: %v", err)
+	}
+	if target.DBTarget != "direct" || target.DBTargetPath != dbPath {
+		t.Fatalf("no-sync refresh db target = %+v", target)
 	}
 
 	st, err = store.Open(ctx, dbPath)

@@ -60,13 +60,16 @@ If the remote is unreachable, the read still answers from the local checkout.
 
 ## How write commands behave
 
-Write commands (`embed`, `refresh`, `cluster`, neighbor generation) need to persist new data without mutating the published portable store. They open a **writable runtime mirror** alongside the portable checkout so vectors and overrides land in the runtime cache while the portable database remains read-only.
+Write commands (`sync`, `embed`, `refresh`, `portable prune`, `cluster`, neighbor generation) open a **writable runtime mirror** alongside the portable checkout so new GitHub data, vectors, and overrides persist without partially mutating the published portable store. When this redirect engages, gitcrawl prints one stderr notice naming both the runtime mirror and the checkout database.
+
+JSON output from `sync`, `refresh`, and `portable prune` makes that destination machine-readable: `db_target` is `runtime-mirror`, `db_target_path` names the database actually written, and `portable_source_db` names the database in the checkout. With a non-portable local database, `db_target` is `direct`, `db_target_path` names that database, and `portable_source_db` is omitted.
 
 This separation means:
 
 - You can `gitcrawl embed` against a portable store without dirtying the Git checkout
 - Local cluster overrides (`close-cluster`, exclusions, canonicals) live in the runtime mirror
-- Only the publishing workflow writes back into the portable checkout
+- Before publishing, even `refresh` writes only to the runtime mirror and leaves the checkout database untouched
+- The `portable prune` publishing step is the boundary that writes a validated database and manifest back into the checkout
 
 ## Publishing: `gitcrawl portable prune`
 
@@ -75,12 +78,13 @@ gitcrawl portable prune
 gitcrawl portable prune --body-chars 256       # default
 gitcrawl portable prune --body-chars 512 --no-vacuum
 gitcrawl portable prune --include-sync-failures # opt-in, error text redacted
+gitcrawl portable prune --no-publish            # prune only the runtime mirror
 gitcrawl portable prune --json
 ```
 
-`portable prune` validates the pruned database with SQLite `quick_check`, writes a `.manifest.json` next to the database with size and SHA-256 integrity, and includes the manifest path plus hash in JSON output. Consumers use that manifest to reject incomplete or mismatched portable-store downloads before replacing a known-good runtime mirror.
+`portable prune` validates the pruned runtime-mirror database with SQLite `quick_check` and writes a `.manifest.json` next to it with size and SHA-256 integrity. When the configured `db_path` is inside a portable checkout, prune then stages the database and manifest inside that checkout, validates the staged pair, and replaces the published files with atomic renames while preserving their existing permissions. A failed publish restores the previously published pair; an interrupted one is caught later by manifest validation and the standard repair path, the same way an interrupted `git pull` of the store is. Pass `--no-publish` to leave the pruned result only in the runtime mirror. Consumers use the manifest to reject incomplete or mismatched portable-store downloads before replacing a known-good runtime mirror.
 
-`prune` converts the database into the portable v2 backup format and (by default) runs SQLite `VACUUM` to reclaim space. The result is a smaller database suitable for committing back to Git.
+`prune` converts the database into the portable v2 backup format and (by default) runs SQLite `VACUUM` to reclaim space. The result is a smaller database and matching manifest ready to commit from the portable checkout. JSON output includes `published`, which is true only when this copy-back happened, plus `published_db_path` and `published_manifest_path` when published.
 
 Portable v2 keeps the data agents most often need for offline GitHub reads:
 
@@ -99,9 +103,10 @@ Portable mirrors retain existing revision-bound key summaries, but do not regene
 | `--body-chars <n>` | `256` | Maximum body characters to keep per thread/comment excerpt |
 | `--no-vacuum` | _(off)_ | Skip size-reclaim `VACUUM`; a present or pending failure ledger still forces a secure rewrite |
 | `--include-sync-failures` | _(off)_ | Keep the sync failure ledger while replacing every error message with a redaction marker |
+| `--no-publish` | _(off)_ | Prune the runtime mirror without publishing the database and manifest back to a portable checkout |
 | `--json` | _(off)_ | JSON output |
 
-After pruning, commit and push the database file from the portable checkout the way you would for any Git repository.
+After pruning, commit and push both the database and its `.manifest.json` from the portable checkout the way you would for any Git repository.
 
 ## A typical publishing flow
 
@@ -109,13 +114,13 @@ After pruning, commit and push the database file from the portable checkout the 
 # In the portable store checkout, refresh upstream data into the local runtime mirror.
 gitcrawl refresh owner/repo
 
-# Prune for a small, shareable footprint.
+# Prune for a small, shareable footprint and publish the database plus manifest into the checkout.
 gitcrawl portable prune --body-chars 256
 
 # Commit and push using normal Git from the configured portable checkout.
 cd ~/Library/Application\ Support/gitcrawl/stores/gitcrawl-store
 # Linux default: cd ~/.config/gitcrawl/stores/gitcrawl-store
-git add data/openclaw__openclaw.sync.db
+git add data/openclaw__openclaw.sync.db data/openclaw__openclaw.sync.db.manifest.json
 git commit -m "data: refresh openclaw/gitcrawl"
 git push
 ```
@@ -132,7 +137,7 @@ The v2 backup also keeps comments and PR-detail tables for local review, cluster
 
 - The portable store carries the SQLite database. It does not carry the Octopool `gh` cache.
 - Vectors regenerated on each consumer's machine after `embed` are not shared; portable pruning removes vector tables from the published database.
-- Portable stores are read-mostly. Multiple writers pushing concurrently will race the way any Git workflow does — gate writes through a single publisher or a CI workflow.
+- Portable stores are read-mostly. Multiple writers pushing concurrently — including concurrent `portable prune` publishers against the same checkout — race the way any Git workflow does; gate writes through a single publisher or a CI workflow.
 
 ## See also
 

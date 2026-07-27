@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -68,6 +69,7 @@ type App struct {
 	configPath          string
 	format              OutputFormat
 	getWorkingDirectory func() (string, error)
+	dbTargetNoticeOnce  sync.Once
 }
 
 type initResult struct {
@@ -349,6 +351,7 @@ type refreshResult struct {
 	Sync       *syncer.Stats   `json:"sync,omitempty"`
 	Embed      *embedResult    `json:"embed,omitempty"`
 	Cluster    map[string]any  `json:"cluster,omitempty"`
+	dbTargetInfo
 }
 
 func (a *App) runRefresh(ctx context.Context, args []string) error {
@@ -422,7 +425,7 @@ func (a *App) runRefresh(ctx context.Context, args []string) error {
 	}
 	if !*noSync {
 		fmt.Fprintln(a.Stderr, "[refresh] sync")
-		stats, err := a.syncRepository(ctx, owner, repoName, syncOptions{
+		stats, target, err := a.syncRepository(ctx, owner, repoName, syncOptions{
 			Since:            strings.TrimSpace(*since),
 			State:            strings.TrimSpace(*state),
 			Limit:            limit,
@@ -434,6 +437,7 @@ func (a *App) runRefresh(ctx context.Context, args []string) error {
 		}
 		result.Repository = stats.Repository
 		result.Sync = &stats
+		result.dbTargetInfo = target
 	}
 	if !*noEmbed {
 		fmt.Fprintln(a.Stderr, "[refresh] embed")
@@ -443,12 +447,18 @@ func (a *App) runRefresh(ctx context.Context, args []string) error {
 		}
 		result.Repository = embed.Repository
 		result.Embed = &embed
+		if result.DBTarget == "" {
+			result.dbTargetInfo = embed.dbTarget
+		}
 	}
 	if !*noCluster {
 		fmt.Fprintln(a.Stderr, "[refresh] cluster")
 		rt, err := a.openLocalRuntime(ctx)
 		if err != nil {
 			return err
+		}
+		if result.DBTarget == "" {
+			result.dbTargetInfo = rt.dbTarget()
 		}
 		repo, err := rt.repository(ctx, owner, repoName)
 		if err != nil {
@@ -1230,6 +1240,7 @@ type embedResult struct {
 	Status     string             `json:"status,omitempty"`
 	Failures   []embedFailureStat `json:"failures,omitempty"`
 	RunID      int64              `json:"run_id"`
+	dbTarget   dbTargetInfo
 }
 
 type embedFailureStat struct {
@@ -1425,6 +1436,7 @@ func (a *App) embedRepository(ctx context.Context, owner, repoName string, optio
 		Retries:    totalRetries,
 		Status:     status,
 		Failures:   failures,
+		dbTarget:   rt.dbTarget(),
 	}
 	statsJSON, _ := json.Marshal(result)
 	runRecord := store.RunRecord{
@@ -2895,7 +2907,7 @@ func (a *App) runSync(ctx context.Context, args []string) error {
 		return usageErr(err)
 	}
 
-	stats, err := a.syncRepository(ctx, owner, repo, syncOptions{
+	stats, target, err := a.syncRepository(ctx, owner, repo, syncOptions{
 		Since:            strings.TrimSpace(*since),
 		State:            strings.TrimSpace(*state),
 		Limit:            limit,
@@ -2906,7 +2918,11 @@ func (a *App) runSync(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return a.writeOutput("sync", stats, true)
+	result := struct {
+		syncer.Stats
+		dbTargetInfo
+	}{Stats: stats, dbTargetInfo: target}
+	return a.writeOutput("sync", result, true)
 }
 
 type syncOptions struct {
@@ -3035,7 +3051,7 @@ func (a *App) runFillPRDetails(ctx context.Context, args []string) error {
 				Numbers:    batchNumbers,
 			})
 		}
-		stats, err := a.syncRepository(ctx, owner, repoName, syncOptions{
+		stats, _, err := a.syncRepository(ctx, owner, repoName, syncOptions{
 			Numbers:          batchNumbers,
 			IncludeComments:  *includeComments,
 			IncludePRDetails: true,
@@ -3175,23 +3191,24 @@ func parseSyncWith(value string) (map[string]bool, error) {
 	return out, nil
 }
 
-func (a *App) syncRepository(ctx context.Context, owner, repo string, options syncOptions) (syncer.Stats, error) {
+func (a *App) syncRepository(ctx context.Context, owner, repo string, options syncOptions) (syncer.Stats, dbTargetInfo, error) {
 	cfg, err := config.LoadRuntime(a.configPath)
 	if err != nil {
-		return syncer.Stats{}, err
+		return syncer.Stats{}, dbTargetInfo{}, err
 	}
 	token := a.resolveGitHubToken(ctx, cfg)
 	if token.Value == "" {
-		return syncer.Stats{}, fmt.Errorf("missing GitHub token: set %s or authenticate gh", cfg.GitHub.TokenEnv)
+		return syncer.Stats{}, dbTargetInfo{}, fmt.Errorf("missing GitHub token: set %s or authenticate gh", cfg.GitHub.TokenEnv)
 	}
 	if err := config.EnsureRuntimeDirs(cfg); err != nil {
-		return syncer.Stats{}, err
+		return syncer.Stats{}, dbTargetInfo{}, err
 	}
 	rt, err := a.openLocalRuntime(ctx)
 	if err != nil {
-		return syncer.Stats{}, err
+		return syncer.Stats{}, dbTargetInfo{}, err
 	}
 	defer rt.Store.Close()
+	target := rt.dbTarget()
 
 	var reporter gh.Reporter
 	var logger *slog.Logger
@@ -3222,9 +3239,9 @@ func (a *App) syncRepository(ctx context.Context, owner, repo string, options sy
 		Logger:           logger,
 	})
 	if err != nil {
-		return syncer.Stats{}, err
+		return syncer.Stats{}, target, err
 	}
-	return stats, nil
+	return stats, target, nil
 }
 
 func progressLogger(w io.Writer) *slog.Logger {
@@ -3388,6 +3405,7 @@ func (a *App) runPortablePrune(ctx context.Context, args []string) error {
 	bodyCharsRaw := fs.String("body-chars", "256", "maximum thread body characters to keep")
 	noVacuum := fs.Bool("no-vacuum", false, "skip size-reclaim vacuum unless needed to scrub failure history")
 	includeSyncFailures := fs.Bool("include-sync-failures", false, "include the sync failure ledger with redacted error messages")
+	noPublish := fs.Bool("no-publish", false, "do not publish the pruned runtime mirror back to the portable checkout")
 	jsonOut := fs.Bool("json", false, "write JSON output")
 	if err := fs.Parse(normalizeCommandArgs(args, map[string]bool{"body-chars": true})); err != nil {
 		return usageErr(err)
@@ -3408,6 +3426,9 @@ func (a *App) runPortablePrune(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	target := rt.dbTarget()
+	remoteSource := rt.RemoteSource
+	sourceDBPath := rt.SourceDBPath
 	stats, err := rt.Store.PrunePortablePayloads(ctx, store.PortablePruneOptions{
 		BodyChars:           bodyChars,
 		Vacuum:              !*noVacuum,
@@ -3430,7 +3451,24 @@ func (a *App) runPortablePrune(ctx context.Context, args []string) error {
 	stats.ManifestPath = manifestPath
 	stats.SHA256 = sha
 	stats.QuickCheck = "ok"
-	return a.writeOutput("portable prune", stats, true)
+	result := struct {
+		store.PortablePruneStats
+		dbTargetInfo
+		Published             bool   `json:"published"`
+		PublishedDBPath       string `json:"published_db_path,omitempty"`
+		PublishedManifestPath string `json:"published_manifest_path,omitempty"`
+	}{PortablePruneStats: stats, dbTargetInfo: target}
+	if remoteSource && !*noPublish {
+		publishedManifestPath := portableDBManifestPath(sourceDBPath)
+		if err := publishPortableCheckoutPair(ctx, stats.DBPath, manifestPath, sourceDBPath, publishedManifestPath); err != nil {
+			return fmt.Errorf("publish portable store: %w", err)
+		}
+		result.Published = true
+		result.PublishedDBPath = sourceDBPath
+		result.PublishedManifestPath = publishedManifestPath
+		fmt.Fprintf(a.Stderr, "gitcrawl: published pruned database to %s; commit both the database and %s.\n", sourceDBPath, publishedManifestPath)
+	}
+	return a.writeOutput("portable prune", result, true)
 }
 
 func writePortableDBManifest(stats store.PortablePruneStats) (string, string, error) {
@@ -5316,7 +5354,7 @@ The TUI quietly refreshes from the local store every 15 seconds and leaves the c
 const portableUsageText = `gitcrawl portable manages local portable-store snapshots.
 
 Usage:
-  gitcrawl portable prune [--body-chars N] [--no-vacuum] [--include-sync-failures] [--json]
+  gitcrawl portable prune [--body-chars N] [--no-vacuum] [--include-sync-failures] [--no-publish] [--json]
 
 Subcommands:
   prune               prune volatile payloads from the configured portable store
@@ -5324,4 +5362,6 @@ Subcommands:
 The sync failure ledger is excluded by default. --include-sync-failures keeps
 the ledger but replaces every error message with a redaction marker. A present
 or pending ledger forces a secure database rewrite even with --no-vacuum.
+For a portable checkout, prune publishes the database and manifest back into
+the checkout by default. --no-publish leaves them only in the runtime mirror.
 `

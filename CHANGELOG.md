@@ -2,6 +2,12 @@
 
 ## 0.8.5 - Unreleased
 
+### Portable stores
+
+- Report writable-command redirects to portable runtime mirrors on stderr and expose `db_target`, `db_target_path`, and `portable_source_db` in `sync`, `refresh`, and `portable prune` JSON output.
+- Publish the pruned database and manifest back to the portable checkout by default so the documented publishing flow cannot commit stale data, with `--no-publish` available for mirror-only pruning.
+- Remove temporary SQLite `-wal` and `-shm` sidecars after atomic copies and sweep orphaned aged temp files from portable runtime mirror directories.
+
 ## 0.8.4 - 2026-07-22
 
 ### Cached search
