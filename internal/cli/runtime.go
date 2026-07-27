@@ -136,12 +136,19 @@ func refreshPortableStoreForDB(ctx context.Context, dbPath string) error {
 	if !ok {
 		return nil
 	}
-	if !gitWorktreeClean(ctx, root) {
+	clean := gitWorktreeClean(ctx, root)
+	if !clean {
+		removed, _ := removeStaleGitIndexLock(ctx, root, staleGitIndexLockAge)
+		if removed {
+			clean = gitWorktreeClean(ctx, root)
+		}
+	}
+	if !clean {
 		return errPortableStoreDirty
 	}
 	pullCtx, cancel := context.WithTimeout(ctx, portableStoreRefreshTimeout)
 	defer cancel()
-	if err := fastForwardGitCheckout(pullCtx, root, true); err != nil {
+	if _, err := fastForwardGitCheckoutWithStaleIndexLockRetry(pullCtx, root, true); err != nil {
 		return err
 	}
 	return removePortableSQLiteSidecars(root)
@@ -275,10 +282,31 @@ func refreshPortableRuntimeDB(ctx context.Context, sourceDBPath, mirrorPath stri
 		_ = refreshPortableStoreForDBIfDue(ctx, sourceDBPath, mirrorPath)
 	}
 	needsCopy, err := portableRuntimeNeedsCopy(sourceDBPath, mirrorPath)
-	if err != nil {
-		return false, err
-	}
 	statePath := portableStoreRefreshStatePath(mirrorPath)
+	if err != nil {
+		if !isRepairablePortableSource || !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+		repair, repairErr := repairMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
+		recordPortableRepairState(statePath, repair, repairErr)
+		if repairErr != nil {
+			if mirrorHealthErr := sqliteStoreHealth(ctx, mirrorPath); mirrorHealthErr == nil {
+				return false, nil
+			}
+			return false, fmt.Errorf("repair malformed portable store db: %w", repairErr)
+		}
+		if _, statErr := os.Stat(sourceDBPath); errors.Is(statErr, os.ErrNotExist) {
+			reclone, recloneErr := recloneMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
+			recordPortableRepairState(statePath, reclone, recloneErr)
+			if recloneErr != nil {
+				return false, fmt.Errorf("reclone malformed portable store db: %w", recloneErr)
+			}
+		}
+		needsCopy, err = portableRuntimeNeedsCopy(sourceDBPath, mirrorPath)
+		if err != nil {
+			return false, err
+		}
+	}
 	mirrorCorrupt := false
 	if isRepairablePortableSource && !needsCopy {
 		mirrorHealthErr := portableMirrorCachedHealth(ctx, mirrorPath, sourceDBPath, statePath)

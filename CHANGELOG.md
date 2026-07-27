@@ -2,6 +2,11 @@
 
 ## 0.8.6 - Unreleased
 
+### Portable stores
+
+- Remove verified-stale Git index locks during ordinary reads and refreshes instead of treating the checkout as dirty forever.
+- Repair a missing portable source database through the standard reset-pull and reclone flow instead of returning a permanent stat error.
+
 ## 0.8.5 - 2026-07-26
 
 ### Portable stores

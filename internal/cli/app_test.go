@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -3133,6 +3134,80 @@ func TestReadCommandRefreshesPortableStore(t *testing.T) {
 	}
 }
 
+func TestRefreshPortableStoreRecoversFromStaleIndexLock(t *testing.T) {
+	if _, err := exec.LookPath("lsof"); err != nil {
+		t.Skip("lsof is required for verified stale-lock recovery")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable issue")
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+
+	lockPath := filepath.Join(checkoutDir, ".git", "index.lock")
+	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
+		t.Fatalf("write index lock: %v", err)
+	}
+	oldLock := time.Now().Add(-staleGitIndexLockAge - time.Second)
+	if err := os.Chtimes(lockPath, oldLock, oldLock); err != nil {
+		t.Fatalf("age index lock: %v", err)
+	}
+	if err := refreshPortableStoreForDB(ctx, filepath.Join(checkoutDir, dbRel)); err != nil {
+		t.Fatalf("refresh portable store: %v", err)
+	}
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale index lock should be removed, err=%v", err)
+	}
+}
+
+func TestRefreshPortableStoreStillDirtyWithoutStaleLock(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable issue")
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+
+	checkoutDB := filepath.Join(checkoutDir, dbRel)
+	if err := os.WriteFile(checkoutDB, []byte("dirty portable db"), 0o644); err != nil {
+		t.Fatalf("modify checkout db: %v", err)
+	}
+	if err := refreshPortableStoreForDB(ctx, checkoutDB); !errors.Is(err, errPortableStoreDirty) {
+		t.Fatalf("refresh dirty portable store err=%v, want %v", err, errPortableStoreDirty)
+	}
+}
+
 func TestReadCommandUsesCachedPortableStoreWhenRefreshFails(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -3374,6 +3449,49 @@ func TestPortableRuntimePropagatesNonCorruptionSourceErrors(t *testing.T) {
 	}
 	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
 		t.Fatalf("healthy mirror should remain usable: %v", err)
+	}
+}
+
+func TestPortableRuntimeRepairsMissingSourceDB(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable issue")
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+
+	checkoutDB := filepath.Join(checkoutDir, dbRel)
+	mirrorPath := filepath.Join(dir, "runtime", dbRel)
+	if err := os.Remove(checkoutDB); err != nil {
+		t.Fatalf("remove checkout db: %v", err)
+	}
+	changed, err := refreshPortableRuntimeDB(ctx, checkoutDB, mirrorPath, false, filepath.Join(dir, "config.toml"))
+	if err != nil {
+		t.Fatalf("refresh portable runtime db: %v", err)
+	}
+	if !changed {
+		t.Fatal("missing source repair should refresh the runtime mirror")
+	}
+	if err := sqliteStoreHealth(ctx, checkoutDB); err != nil {
+		t.Fatalf("checkout db should be restored and healthy: %v", err)
+	}
+	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
+		t.Fatalf("runtime mirror should be created and healthy: %v", err)
 	}
 }
 
