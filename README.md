@@ -167,7 +167,8 @@ The image stores config, SQLite data, cache, and Git snapshot state under `/data
 ## Development
 
 ```bash
-go test ./...
-go build ./cmd/gitcrawl
-go run ./cmd/gitcrawl help tui
+make help
+make check
+make build
+make run ARGS="help tui"
 ```
