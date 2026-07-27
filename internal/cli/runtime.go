@@ -330,6 +330,16 @@ func refreshPortableRuntimeDB(ctx context.Context, sourceDBPath, mirrorPath stri
 			repair, err := repairMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
 			recordPortableRepairState(statePath, repair, err)
 			if err != nil {
+				state := readPortableStoreRefreshState(statePath)
+				if !recentPortableRefresh(state.LastRecloneAttempt, time.Now().UTC(), portableSourceRecoveryBackoff) {
+					reclone, recloneErr := recloneMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
+					recordPortableRepairState(statePath, reclone, recloneErr)
+					if recloneErr == nil {
+						err = nil
+					}
+				}
+			}
+			if err != nil {
 				if !mirrorCorrupt {
 					if mirrorHealthErr := sqliteStoreHealth(ctx, mirrorPath); mirrorHealthErr == nil {
 						return false, nil
@@ -377,12 +387,25 @@ type portableStoreRefreshState struct {
 	LastRepairBackup            string `json:"last_repair_backup,omitempty"`
 	LastRepairAt                string `json:"last_repair_at,omitempty"`
 	LastRepairError             string `json:"last_repair_error,omitempty"`
+	LastRecloneAttempt          string `json:"last_reclone_attempt,omitempty"`
 }
 
 func recoverMissingPortableSource(ctx context.Context, sourceDBPath, configPath, statePath string) error {
 	repair, err := repairMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
 	recordPortableRepairState(statePath, repair, err)
 	if err != nil {
+		state := readPortableStoreRefreshState(statePath)
+		if !recentPortableRefresh(state.LastRecloneAttempt, time.Now().UTC(), portableSourceRecoveryBackoff) {
+			reclone, recloneErr := recloneMalformedPortableStoreForDB(ctx, sourceDBPath, configPath)
+			recordPortableRepairState(statePath, reclone, recloneErr)
+			if recloneErr == nil {
+				// The caller re-stats the source and falls back to a healthy
+				// mirror if the recloned store still lacks the database;
+				// falling through here would reclone a second time.
+				return nil
+			}
+			return fmt.Errorf("repair malformed portable store db: %w; reclone fallback: %v", err, recloneErr)
+		}
 		return fmt.Errorf("repair malformed portable store db: %w", err)
 	}
 	if _, statErr := os.Stat(sourceDBPath); errors.Is(statErr, os.ErrNotExist) {
@@ -487,8 +510,12 @@ func recordPortableRepairState(path string, result portableRepairResult, repairE
 		return
 	}
 	state := readPortableStoreRefreshState(path)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	state.LastRepair = result.Action
-	state.LastRepairAt = time.Now().UTC().Format(time.RFC3339Nano)
+	state.LastRepairAt = now
+	if result.Action == "recloned" {
+		state.LastRecloneAttempt = now
+	}
 	state.LastRepairBackup = result.DBBackupPath
 	if result.StoreBackupPath != "" {
 		state.LastRepairBackup = result.StoreBackupPath
@@ -498,6 +525,10 @@ func recordPortableRepairState(path string, result portableRepairResult, repairE
 	} else {
 		state.LastRepairError = ""
 	}
+	// The state file gates repair/reclone backoffs; without its parent
+	// directory (fresh install, mirror never created) a silent write failure
+	// would leave recovery attempts unbounded.
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	_ = writePortableStoreRefreshState(path, state)
 }
 

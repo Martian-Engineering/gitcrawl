@@ -3326,6 +3326,238 @@ func TestReadCommandRepairsMalformedDirtyPortableStore(t *testing.T) {
 	}
 }
 
+type portableRepairFailureFixture struct {
+	dir         string
+	checkoutDir string
+	checkoutDB  string
+	dbRel       string
+	configPath  string
+}
+
+func newPortableRepairFailureFixture(t *testing.T) portableRepairFailureFixture {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable repair fallback")
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+	return portableRepairFailureFixture{
+		dir:         dir,
+		checkoutDir: checkoutDir,
+		checkoutDB:  filepath.Join(checkoutDir, dbRel),
+		dbRel:       dbRel,
+		configPath:  filepath.Join(dir, "config.toml"),
+	}
+}
+
+func corruptPortableCheckoutIndex(t *testing.T, checkoutDir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(checkoutDir, ".git", "index"), []byte{0x01, 0x02, 0x03, 0x04}, 0o644); err != nil {
+		t.Fatalf("corrupt checkout index: %v", err)
+	}
+	if err := runGit(context.Background(), "", "-C", checkoutDir, "reset", "--hard", "HEAD"); err == nil {
+		t.Fatal("git reset --hard HEAD unexpectedly accepted the corrupt index")
+	}
+}
+
+func countPortableCheckoutMalformedBackups(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, "backups"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0
+		}
+		t.Fatalf("read portable backups: %v", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "checkout-malformed-") {
+			count++
+		}
+	}
+	return count
+}
+
+func TestPortableRuntimeReclonesWhenRepairFails(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortableRepairFailureFixture(t)
+	mirrorPath := filepath.Join(fixture.dir, "runtime", fixture.dbRel)
+	statePath := portableStoreRefreshStatePath(mirrorPath)
+	if err := os.WriteFile(fixture.checkoutDB, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("corrupt checkout db: %v", err)
+	}
+	corruptPortableCheckoutIndex(t, fixture.checkoutDir)
+
+	repair, repairErr := repairMalformedPortableStoreForDB(ctx, fixture.checkoutDB, fixture.configPath)
+	if repairErr == nil {
+		t.Fatal("repair unexpectedly succeeded with a corrupt Git index")
+	}
+	recordPortableRepairState(statePath, repair, repairErr)
+	if state := readPortableStoreRefreshState(statePath); state.LastRepairError != repairErr.Error() {
+		t.Fatalf("recorded repair error = %q, want %q", state.LastRepairError, repairErr.Error())
+	}
+
+	changed, err := refreshPortableRuntimeDB(ctx, fixture.checkoutDB, mirrorPath, false, fixture.configPath)
+	if err != nil {
+		t.Fatalf("refresh portable runtime db: %v", err)
+	}
+	if !changed {
+		t.Fatal("successful reclone should refresh the runtime mirror")
+	}
+	if err := sqliteStoreHealth(ctx, fixture.checkoutDB); err != nil {
+		t.Fatalf("recloned checkout db should be healthy: %v", err)
+	}
+	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
+		t.Fatalf("runtime mirror should be healthy: %v", err)
+	}
+	if err := runGit(ctx, "", "-C", fixture.checkoutDir, "status", "--short"); err != nil {
+		t.Fatalf("recloned checkout git status: %v", err)
+	}
+	if got := countPortableCheckoutMalformedBackups(t, fixture.dir); got != 1 {
+		t.Fatalf("recloned checkout backups = %d, want 1", got)
+	}
+	state := readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt == "" {
+		t.Fatal("last_reclone_attempt should be recorded")
+	}
+	if state.LastRepair != "recloned" {
+		t.Fatalf("last_repair = %q, want recloned", state.LastRepair)
+	}
+}
+
+func TestPortableRuntimeRecloneEscalationBacksOff(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortableRepairFailureFixture(t)
+	mirrorPath := filepath.Join(fixture.dir, "runtime", fixture.dbRel)
+	if err := copyFileAtomic(fixture.checkoutDB, mirrorPath); err != nil {
+		t.Fatalf("seed healthy mirror: %v", err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(mirrorPath, past, past); err != nil {
+		t.Fatalf("age healthy mirror: %v", err)
+	}
+	if err := os.WriteFile(fixture.checkoutDB, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("corrupt checkout db: %v", err)
+	}
+	corruptPortableCheckoutIndex(t, fixture.checkoutDir)
+
+	statePath := portableStoreRefreshStatePath(mirrorPath)
+	recloneAttempt := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := writePortableStoreRefreshState(statePath, portableStoreRefreshState{LastRecloneAttempt: recloneAttempt}); err != nil {
+		t.Fatalf("write reclone backoff state: %v", err)
+	}
+	backupsBefore := countPortableCheckoutMalformedBackups(t, fixture.dir)
+	changed, err := refreshPortableRuntimeDB(ctx, fixture.checkoutDB, mirrorPath, false, fixture.configPath)
+	if err != nil {
+		t.Fatalf("healthy mirror fallback: %v", err)
+	}
+	if changed {
+		t.Fatal("backed-off reclone should keep serving the existing mirror")
+	}
+	if got := countPortableCheckoutMalformedBackups(t, fixture.dir); got != backupsBefore {
+		t.Fatalf("backed-off reclone created checkout backup: %d -> %d", backupsBefore, got)
+	}
+	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
+		t.Fatalf("healthy mirror should remain usable: %v", err)
+	}
+	if err := sqliteStoreHealth(ctx, fixture.checkoutDB); err == nil {
+		t.Fatal("broken checkout database unexpectedly became healthy")
+	}
+	if err := runGit(ctx, "", "-C", fixture.checkoutDir, "status", "--short"); err == nil {
+		t.Fatal("broken checkout Git index unexpectedly became usable")
+	}
+	state := readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt != recloneAttempt {
+		t.Fatalf("last_reclone_attempt = %q, want unchanged %q", state.LastRecloneAttempt, recloneAttempt)
+	}
+	if state.LastRepairError == "" {
+		t.Fatal("failed repair should record last_repair_error")
+	}
+}
+
+func TestPortableRuntimeFailedRecloneStillEstablishesBackoff(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortableRepairFailureFixture(t)
+	mirrorPath := filepath.Join(fixture.dir, "runtime", fixture.dbRel)
+	if err := copyFileAtomic(fixture.checkoutDB, mirrorPath); err != nil {
+		t.Fatalf("seed healthy mirror: %v", err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(mirrorPath, past, past); err != nil {
+		t.Fatalf("age healthy mirror: %v", err)
+	}
+	if err := os.WriteFile(fixture.checkoutDB, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("corrupt checkout db: %v", err)
+	}
+	// Break repair (corrupt index) AND reclone (unreachable remote) so the
+	// escalation itself fails; the attempt must still stamp the backoff.
+	if err := runGit(ctx, "", "-C", fixture.checkoutDir, "remote", "set-url", "origin", filepath.Join(fixture.dir, "no-such-remote")); err != nil {
+		t.Fatalf("break remote url: %v", err)
+	}
+	corruptPortableCheckoutIndex(t, fixture.checkoutDir)
+
+	statePath := portableStoreRefreshStatePath(mirrorPath)
+	if changed, err := refreshPortableRuntimeDB(ctx, fixture.checkoutDB, mirrorPath, false, fixture.configPath); err != nil || changed {
+		t.Fatalf("failed reclone should fall back to the healthy mirror, changed=%v err=%v", changed, err)
+	}
+	state := readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt == "" {
+		t.Fatal("failed reclone must still record last_reclone_attempt")
+	}
+	firstAttempt := state.LastRecloneAttempt
+
+	if changed, err := refreshPortableRuntimeDB(ctx, fixture.checkoutDB, mirrorPath, false, fixture.configPath); err != nil || changed {
+		t.Fatalf("backed-off retry should keep serving the mirror, changed=%v err=%v", changed, err)
+	}
+	state = readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt != firstAttempt {
+		t.Fatalf("backed-off retry must not re-attempt reclone: %q -> %q", firstAttempt, state.LastRecloneAttempt)
+	}
+}
+
+func TestRecoverMissingPortableSourceReclonesWhenRepairFails(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortableRepairFailureFixture(t)
+	if err := os.Remove(fixture.checkoutDB); err != nil {
+		t.Fatalf("remove checkout db: %v", err)
+	}
+	corruptPortableCheckoutIndex(t, fixture.checkoutDir)
+
+	statePath := filepath.Join(fixture.dir, "runtime", ".portable-refresh.json")
+	if err := recoverMissingPortableSource(ctx, fixture.checkoutDB, fixture.configPath, statePath); err != nil {
+		t.Fatalf("recover missing portable source: %v", err)
+	}
+	if err := sqliteStoreHealth(ctx, fixture.checkoutDB); err != nil {
+		t.Fatalf("recloned checkout db should be healthy: %v", err)
+	}
+	if err := runGit(ctx, "", "-C", fixture.checkoutDir, "status", "--short"); err != nil {
+		t.Fatalf("recloned checkout git status: %v", err)
+	}
+	state := readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt == "" {
+		t.Fatal("last_reclone_attempt should be recorded")
+	}
+	if state.LastRepair != "recloned" {
+		t.Fatalf("last_repair = %q, want recloned", state.LastRepair)
+	}
+}
+
 func TestRecloneMalformedPortableStorePreservesBranch(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
