@@ -472,15 +472,17 @@ func TestCloudSQLiteSnapshotDropsLocalCodeCorpus(t *testing.T) {
 	`).Scan(&repositoryRawJSON, &threadRawJSON, &detailRawJSON, &filePatch, &fileRawJSON); err != nil {
 		t.Fatalf("inspect scrubbed cloud payloads: %v", err)
 	}
-	if repositoryRawJSON != "" || threadRawJSON != "" || detailRawJSON != "" || filePatch != "" || fileRawJSON != "" {
+	if repositoryRawJSON != "" || threadRawJSON != "" || detailRawJSON != "" || fileRawJSON != "" {
 		t.Fatalf(
-			"cloud snapshot retained private payloads: repository=%q thread=%q detail=%q patch=%q file=%q",
+			"cloud snapshot retained raw payloads: repository=%q thread=%q detail=%q file=%q",
 			repositoryRawJSON,
 			threadRawJSON,
 			detailRawJSON,
-			filePatch,
 			fileRawJSON,
 		)
+	}
+	if filePatch != "@@ private source" {
+		t.Fatalf("cloud snapshot patch = %q, want full structured patch text", filePatch)
 	}
 	var blobCount int
 	if err := snapshotDB.QueryRowContext(ctx, `select count(*) from blobs`).Scan(&blobCount); err != nil {

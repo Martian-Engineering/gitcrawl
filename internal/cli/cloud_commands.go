@@ -1758,7 +1758,6 @@ func sanitizeCloudSQLiteSnapshot(ctx context.Context, db *sql.DB) error {
 	}{
 		{table: "comments", name: "raw_json_blob_id"},
 		{table: "thread_revisions", name: "raw_json_blob_id"},
-		{table: "pull_request_files", name: "patch"},
 	} {
 		exists, err := sqliteColumnExists(ctx, db, column.table, column.name)
 		if err != nil {
@@ -1767,13 +1766,9 @@ func sanitizeCloudSQLiteSnapshot(ctx context.Context, db *sql.DB) error {
 		if !exists {
 			continue
 		}
-		value := "null"
-		if column.name == "patch" {
-			value = "''"
-		}
 		if _, err := db.ExecContext(
 			ctx,
-			`update `+column.table+` set `+column.name+` = `+value+` where `+column.name+` is not null`,
+			`update `+column.table+` set `+column.name+` = null where `+column.name+` is not null`,
 		); err != nil {
 			return fmt.Errorf("clear cloud snapshot %s.%s: %w", column.table, column.name, err)
 		}
