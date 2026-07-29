@@ -254,6 +254,19 @@ func (s *Store) upsertThreadObservation(ctx context.Context, thread Thread, opti
 	if err != nil {
 		return UpsertThreadResult{}, fmt.Errorf("upsert thread: %w", err)
 	}
+	if s.portableThreadBodyMetadata {
+		if _, err := s.q().ExecContext(ctx, `
+			update threads
+			set body_length = length(coalesce(body, '')),
+				body_excerpt = case
+					when body is null then ''
+					else substr(body, 1, ?)
+				end
+			where id = ?
+		`, s.portableBodyChars, id); err != nil {
+			return UpsertThreadResult{}, fmt.Errorf("refresh portable thread body metadata: %w", err)
+		}
+	}
 	evidenceApplied := false
 	if !options.IncompleteEvidence {
 		evidenceApplied, err = s.reserveThreadEvidenceObservation(

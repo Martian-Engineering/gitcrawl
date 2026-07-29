@@ -34,10 +34,13 @@ type sqliteCoder interface {
 }
 
 type Store struct {
-	db      *sql.DB
-	queries dbQueries
-	sqlc    *storedb.Queries
-	path    string
+	db                          *sql.DB
+	queries                     dbQueries
+	sqlc                        *storedb.Queries
+	path                        string
+	portableThreadBodyMetadata  bool
+	portableCommentBodyMetadata bool
+	portableBodyChars           int
 }
 
 type dbQueries interface {
@@ -67,6 +70,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		_ = base.Close()
 		return nil, err
 	}
+	st.detectPortableBodyMetadata(ctx)
 	return st, nil
 }
 
@@ -166,7 +170,15 @@ func (s *Store) withTxOnce(ctx context.Context, fn func(*Store) error) error {
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	txStore := &Store{db: s.db, queries: tx, sqlc: s.qsql().WithTx(tx), path: s.path}
+	txStore := &Store{
+		db:                          s.db,
+		queries:                     tx,
+		sqlc:                        s.qsql().WithTx(tx),
+		path:                        s.path,
+		portableThreadBodyMetadata:  s.portableThreadBodyMetadata,
+		portableCommentBodyMetadata: s.portableCommentBodyMetadata,
+		portableBodyChars:           s.portableBodyChars,
+	}
 	if err := fn(txStore); err != nil {
 		_ = tx.Rollback()
 		return err
@@ -852,6 +864,26 @@ func (s *Store) hasColumn(ctx context.Context, table, column string) bool {
 		}
 	}
 	return false
+}
+
+func (s *Store) detectPortableBodyMetadata(ctx context.Context) {
+	s.portableThreadBodyMetadata = s.hasColumns(ctx, "threads", "body_excerpt", "body_length")
+	s.portableCommentBodyMetadata = s.hasColumns(ctx, "comments", "body_excerpt", "body_length")
+	if !s.portableThreadBodyMetadata && !s.portableCommentBodyMetadata {
+		return
+	}
+	s.portableBodyChars = 256
+	if !s.hasColumns(ctx, "portable_metadata", "key", "value") {
+		return
+	}
+	var bodyChars int
+	if err := s.q().QueryRowContext(ctx, `
+		select cast(value as integer)
+		from portable_metadata
+		where key = 'body_chars'
+	`).Scan(&bodyChars); err == nil && bodyChars > 0 {
+		s.portableBodyChars = bodyChars
+	}
 }
 
 func (s *Store) schemaVersion(ctx context.Context) (int, error) {

@@ -1664,7 +1664,7 @@ func gitcrawlCloudSQLiteBundlePrivacy() map[string]any {
 	return map[string]any{
 		"includes_private_messages": true,
 		"includes_raw_json":         false,
-		"includes_source_code":      false,
+		"includes_source_code":      true,
 	}
 }
 

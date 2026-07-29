@@ -71,6 +71,16 @@ func (s *Store) upsertComment(ctx context.Context, comment Comment) (int64, erro
 	if err != nil {
 		return 0, fmt.Errorf("upsert comment: %w", err)
 	}
+	if s.portableCommentBodyMetadata {
+		if _, err := s.q().ExecContext(ctx, `
+			update comments
+			set body_length = length(body),
+				body_excerpt = substr(body, 1, ?)
+			where id = ?
+		`, s.portableBodyChars, id); err != nil {
+			return 0, fmt.Errorf("refresh portable comment body metadata: %w", err)
+		}
+	}
 	if err := s.recordCommentRevision(ctx, id, time.Now().UTC().Format(timeLayout)); err != nil {
 		return 0, err
 	}

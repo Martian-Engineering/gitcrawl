@@ -75,9 +75,11 @@ R2, uploads its digest-scoped bundle, and completes staged D1 coverage through
 row- and encoded-byte-bounded ingest requests.
 The cloud SQLite image preserves full canonical issue and pull-request bodies,
 comments, revisions, review comments, and PR patch text. Gzip is lossless
-transport, not portable-store compaction. Publication still removes raw API
-payloads, blob-backed payloads, local run diagnostics, source code indexes, and
-machine-local paths; those are not part of the shared archive contract.
+transport, not portable-store compaction. Bundle privacy metadata declares both
+message bodies and source code because patch text is retained. Publication still
+removes raw API payloads, blob-backed payloads, local run diagnostics, source
+code indexes, and machine-local paths; those are not part of the shared archive
+contract.
 Publishing moves unpinned reads to the complete snapshot by default, preserving
 the existing reader-refresh behavior. The remote must advertise
 `gitcrawl.snapshot.staging.v1`; `--stage-only` keeps the immutable snapshot

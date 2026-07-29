@@ -1202,6 +1202,10 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 					http.Error(w, "bundle privacy should disclose message bodies", http.StatusBadRequest)
 					return
 				}
+				if manifest.Privacy["includes_source_code"] != true {
+					http.Error(w, "bundle privacy should disclose patch text", http.StatusBadRequest)
+					return
+				}
 				if manifest.SnapshotID != snapshotID ||
 					manifest.Object.Key != crawlremote.SQLiteSnapshotObjectKey("gitcrawl", "gitcrawl/openclaw__openclaw", snapshotID) {
 					http.Error(w, "bundle snapshot mismatch", http.StatusBadRequest)
@@ -1415,7 +1419,9 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 		}
 	}
 	privacy, ok := payload["sqlite_bundle_privacy"].(map[string]any)
-	if !ok || privacy["includes_private_messages"] != true {
+	if !ok ||
+		privacy["includes_private_messages"] != true ||
+		privacy["includes_source_code"] != true {
 		t.Fatalf("missing sqlite bundle privacy output: %#v", payload)
 	}
 }
