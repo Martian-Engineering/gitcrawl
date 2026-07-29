@@ -2251,3 +2251,131 @@ func TestPrunePortablePayloads(t *testing.T) {
 		t.Fatalf("payloads not pruned: bodyExcerpt=%q titleTokens=%q linkedRefs=%q buckets=%q features=%q", bodyExcerpt, titleTokens, linkedRefs, buckets, features)
 	}
 }
+
+func TestHydrationRefreshesPortableBodyMetadata(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
+		RawJSON: "{}", UpdatedAt: "2026-07-29T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+	threadID, err := st.UpsertThread(ctx, Thread{
+		RepoID: repoID, GitHubID: "1", Number: 1, Kind: "issue", State: "open",
+		Title: "full cloud archive", Body: "old",
+		HTMLURL:    "https://github.com/openclaw/gitcrawl/issues/1",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: `{"body":"old"}`,
+		ContentHash: "original", UpdatedAtGitHub: "2026-07-29T00:00:00Z",
+		UpdatedAt: "2026-07-29T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("thread: %v", err)
+	}
+	if _, err := st.UpsertComment(ctx, Comment{
+		ThreadID: threadID, GitHubID: "c1", CommentType: "issue_comment",
+		Body: "old", RawJSON: "{}",
+		CreatedAtGitHub: "2026-07-29T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("comment: %v", err)
+	}
+	if _, err := st.PrunePortablePayloads(ctx, PortablePruneOptions{BodyChars: 8}); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close portable store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen portable store: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.UpsertThread(ctx, Thread{
+		RepoID: repoID, GitHubID: "1", Number: 1, Kind: "issue", State: "open",
+		Title: "full cloud archive", Body: "new body is longer",
+		HTMLURL:    "https://github.com/openclaw/gitcrawl/issues/1",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: `{"body":"new body is longer"}`,
+		ContentHash: "hydrated", UpdatedAtGitHub: "2026-07-29T01:00:00Z",
+		UpdatedAt: "2026-07-29T01:00:00Z",
+	}); err != nil {
+		t.Fatalf("hydrate thread: %v", err)
+	}
+	if _, err := st.UpsertComment(ctx, Comment{
+		ThreadID: threadID, GitHubID: "c1", CommentType: "issue_comment",
+		Body: "new comment is longer", RawJSON: "{}", CreatedAtGitHub: "2026-07-29T00:00:00Z",
+		UpdatedAtGitHub: "2026-07-29T01:00:00Z",
+	}); err != nil {
+		t.Fatalf("hydrate comment: %v", err)
+	}
+	insertedThreadID, err := st.UpsertThread(ctx, Thread{
+		RepoID: repoID, GitHubID: "2", Number: 2, Kind: "issue", State: "open",
+		Title: "new cloud row", Body: "inserted body is longer",
+		HTMLURL:    "https://github.com/openclaw/gitcrawl/issues/2",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: `{"body":"inserted body is longer"}`,
+		ContentHash: "inserted", UpdatedAtGitHub: "2026-07-29T01:00:00Z",
+		UpdatedAt: "2026-07-29T01:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("insert hydrated thread: %v", err)
+	}
+	if _, err := st.UpsertComment(ctx, Comment{
+		ThreadID: insertedThreadID, GitHubID: "c2", CommentType: "issue_comment",
+		Body: "inserted comment is longer", RawJSON: "{}",
+		CreatedAtGitHub: "2026-07-29T01:00:00Z",
+	}); err != nil {
+		t.Fatalf("insert hydrated comment: %v", err)
+	}
+
+	var threadBody, threadExcerpt string
+	var threadBodyLength int
+	if err := st.DB().QueryRowContext(ctx, `
+		select body, body_excerpt, body_length from threads where id = ?
+	`, threadID).Scan(&threadBody, &threadExcerpt, &threadBodyLength); err != nil {
+		t.Fatalf("read hydrated thread: %v", err)
+	}
+	if threadBody != "new body is longer" ||
+		threadExcerpt != "new body" ||
+		threadBodyLength != len("new body is longer") {
+		t.Fatalf("hydrated thread metadata = body %q excerpt %q length %d", threadBody, threadExcerpt, threadBodyLength)
+	}
+
+	var commentBody, commentExcerpt string
+	var commentBodyLength int
+	if err := st.DB().QueryRowContext(ctx, `
+		select body, body_excerpt, body_length from comments where github_id = 'c1'
+	`).Scan(&commentBody, &commentExcerpt, &commentBodyLength); err != nil {
+		t.Fatalf("read hydrated comment: %v", err)
+	}
+	if commentBody != "new comment is longer" ||
+		commentExcerpt != "new comm" ||
+		commentBodyLength != len("new comment is longer") {
+		t.Fatalf("hydrated comment metadata = body %q excerpt %q length %d", commentBody, commentExcerpt, commentBodyLength)
+	}
+
+	var insertedThreadExcerpt, insertedCommentExcerpt string
+	if err := st.DB().QueryRowContext(ctx, `
+		select body_excerpt from threads where id = ?
+	`, insertedThreadID).Scan(&insertedThreadExcerpt); err != nil {
+		t.Fatalf("read inserted thread excerpt: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select body_excerpt from comments where github_id = 'c2'
+	`).Scan(&insertedCommentExcerpt); err != nil {
+		t.Fatalf("read inserted comment excerpt: %v", err)
+	}
+	if insertedThreadExcerpt != "inserted" || insertedCommentExcerpt != "inserted" {
+		t.Fatalf(
+			"inserted excerpts = thread %q comment %q",
+			insertedThreadExcerpt,
+			insertedCommentExcerpt,
+		)
+	}
+}

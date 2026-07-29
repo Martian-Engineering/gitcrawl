@@ -472,15 +472,17 @@ func TestCloudSQLiteSnapshotDropsLocalCodeCorpus(t *testing.T) {
 	`).Scan(&repositoryRawJSON, &threadRawJSON, &detailRawJSON, &filePatch, &fileRawJSON); err != nil {
 		t.Fatalf("inspect scrubbed cloud payloads: %v", err)
 	}
-	if repositoryRawJSON != "" || threadRawJSON != "" || detailRawJSON != "" || filePatch != "" || fileRawJSON != "" {
+	if repositoryRawJSON != "" || threadRawJSON != "" || detailRawJSON != "" || fileRawJSON != "" {
 		t.Fatalf(
-			"cloud snapshot retained private payloads: repository=%q thread=%q detail=%q patch=%q file=%q",
+			"cloud snapshot retained raw payloads: repository=%q thread=%q detail=%q file=%q",
 			repositoryRawJSON,
 			threadRawJSON,
 			detailRawJSON,
-			filePatch,
 			fileRawJSON,
 		)
+	}
+	if filePatch != "@@ private source" {
+		t.Fatalf("cloud snapshot patch = %q, want full structured patch text", filePatch)
 	}
 	var blobCount int
 	if err := snapshotDB.QueryRowContext(ctx, `select count(*) from blobs`).Scan(&blobCount); err != nil {
@@ -1200,6 +1202,10 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 					http.Error(w, "bundle privacy should disclose message bodies", http.StatusBadRequest)
 					return
 				}
+				if manifest.Privacy["includes_source_code"] != true {
+					http.Error(w, "bundle privacy should disclose patch text", http.StatusBadRequest)
+					return
+				}
 				if manifest.SnapshotID != snapshotID ||
 					manifest.Object.Key != crawlremote.SQLiteSnapshotObjectKey("gitcrawl", "gitcrawl/openclaw__openclaw", snapshotID) {
 					http.Error(w, "bundle snapshot mismatch", http.StatusBadRequest)
@@ -1413,7 +1419,9 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 		}
 	}
 	privacy, ok := payload["sqlite_bundle_privacy"].(map[string]any)
-	if !ok || privacy["includes_private_messages"] != true {
+	if !ok ||
+		privacy["includes_private_messages"] != true ||
+		privacy["includes_source_code"] != true {
 		t.Fatalf("missing sqlite bundle privacy output: %#v", payload)
 	}
 }
