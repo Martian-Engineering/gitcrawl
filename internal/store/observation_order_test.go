@@ -283,6 +283,55 @@ func TestThreadChildObservationReservationsAdvanceIndependently(t *testing.T) {
 			detailsSequence,
 		)
 	}
+	sourceUpdatedAt, sequence, found, err := st.ThreadChildObservation(
+		ctx,
+		threadID,
+		ThreadChildComments,
+	)
+	if err != nil || !found ||
+		sourceUpdatedAt != commentsSource || sequence != commentsSequence {
+		t.Fatalf(
+			"read comments observation = %q/%d/%t, %v",
+			sourceUpdatedAt,
+			sequence,
+			found,
+			err,
+		)
+	}
+	if _, _, found, err := st.ThreadChildObservation(
+		ctx,
+		threadID,
+		ThreadChildPullRequestChecks,
+	); err != nil || found {
+		t.Fatalf("missing checks observation found = %t, %v", found, err)
+	}
+	if err := st.ReplaceThreadChildObservationMembers(
+		ctx,
+		threadID,
+		ThreadChildComments,
+		commentsSequence,
+		[]int64{9, 3, 9, -1},
+	); err != nil {
+		t.Fatalf("replace comments members: %v", err)
+	}
+	memberIDs, found, err := st.ThreadChildObservationMemberIDs(
+		ctx,
+		threadID,
+		ThreadChildComments,
+		commentsSequence,
+	)
+	if err != nil || !found || len(memberIDs) != 2 ||
+		memberIDs[0] != 3 || memberIDs[1] != 9 {
+		t.Fatalf("comments members = %v/%t, %v", memberIDs, found, err)
+	}
+	if _, found, err := st.ThreadChildObservationMemberIDs(
+		ctx,
+		threadID,
+		ThreadChildComments,
+		commentsSequence+1,
+	); err != nil || found {
+		t.Fatalf("future comments members found = %t, %v", found, err)
+	}
 	if _, err := st.ReserveThreadChildObservation(
 		ctx,
 		threadID,

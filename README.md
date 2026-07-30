@@ -28,6 +28,8 @@ gitcrawl whoami --json
 gitcrawl cloud publish --remote https://crawl.openclaw.ai --archive gitcrawl/openclaw__openclaw --json
 gitcrawl sync owner/repo
 gitcrawl sync owner/repo --state open
+gitcrawl sync owner/repo --state all --include-comments
+gitcrawl capture owner/repo --output capture.json
 gitcrawl sync owner/repo --numbers 123,456 --include-comments
 gitcrawl sync owner/repo --numbers https://github.com/owner/repo/issues/123 --with pr-details
 gitcrawl coverage --repos owner/repo,owner/other --min-missing-pr-details 1 --json

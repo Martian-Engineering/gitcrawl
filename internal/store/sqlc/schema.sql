@@ -117,6 +117,15 @@ create table thread_child_observation_reservations (
   primary key(thread_id, family)
 );
 
+create table thread_child_observation_memberships (
+  thread_id integer not null references threads(id) on delete cascade,
+  family text not null,
+  observation_sequence integer not null
+    check (typeof(observation_sequence) = 'integer' and observation_sequence > 0),
+  member_ids_json text not null,
+  primary key(thread_id, family)
+);
+
 create table workflow_run_observation_reservations (
   repo_id integer not null references repositories(id) on delete cascade,
   head_sha text not null check (trim(head_sha) <> ''),

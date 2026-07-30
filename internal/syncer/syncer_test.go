@@ -3353,6 +3353,31 @@ func TestCommentHydrationDoesNotTreatNotSeenAsDeleted(t *testing.T) {
 	}
 	assertTableRowCount(t, st, "comments", 1)
 	assertDocumentFTSCount(t, st, "same", 1)
+	repo, err := st.RepositoryByFullName(ctx, "openclaw/gitcrawl")
+	if err != nil {
+		t.Fatalf("repository after empty snapshot: %v", err)
+	}
+	threads, err := st.ListThreads(ctx, repo.ID, true)
+	if err != nil || len(threads) != 1 {
+		t.Fatalf("threads after empty snapshot = %+v, %v", threads, err)
+	}
+	_, sequence, found, err := st.ThreadChildObservation(
+		ctx,
+		threads[0].ID,
+		store.ThreadChildComments,
+	)
+	if err != nil || !found {
+		t.Fatalf("comment observation after empty snapshot = %d/%t, %v", sequence, found, err)
+	}
+	memberIDs, found, err := st.ThreadChildObservationMemberIDs(
+		ctx,
+		threads[0].ID,
+		store.ThreadChildComments,
+		sequence,
+	)
+	if err != nil || !found || len(memberIDs) != 0 {
+		t.Fatalf("empty comment observation members = %v/%t, %v", memberIDs, found, err)
+	}
 	coverage, err := st.ArchiveCoverage(ctx, store.ArchiveCoverageOptions{})
 	if err != nil {
 		t.Fatalf("archive coverage after empty snapshot: %v", err)
@@ -3392,12 +3417,12 @@ func TestPersistCommentsAppliesSparseExplicitTombstone(t *testing.T) {
 	}
 	if _, _, err := persistComments(ctx, st, thread, []commentRow{{kind: "issue_comment", raw: map[string]any{
 		"id": 1801, "body": "retain this body", "created_at": "2026-07-18T00:01:00Z",
-	}}}); err != nil {
+	}}}, 0); err != nil {
 		t.Fatalf("seed comment: %v", err)
 	}
 	comments, synced, err := persistComments(ctx, st, thread, []commentRow{{kind: "issue_comment", raw: map[string]any{
 		"id": 1801, "deleted_at": "2026-07-18T00:02:00Z", "deletion_reason": "explicit-source-delete",
-	}}})
+	}}}, 0)
 	if err != nil {
 		t.Fatalf("persist sparse tombstone: %v", err)
 	}
@@ -4113,11 +4138,16 @@ func TestMappingFallbackBranches(t *testing.T) {
 		"created_at": "2026-05-05T10:00:00Z",
 		"updated_at": "2026-05-05T11:00:00Z",
 		"closed_at":  "2026-05-05T12:00:00Z",
+		"pull_request": map[string]any{
+			"url":       "https://api.github.com/repos/openclaw/gitcrawl/pulls/456",
+			"merged_at": "2026-05-05T11:30:00Z",
+		},
 	}, "2026-05-05T12:00:00Z")
 	if thread.LabelsJSON != "[]" || thread.AssigneesJSON != "[]" {
 		t.Fatalf("nullable label defaults: labels=%s assignees=%s", thread.LabelsJSON, thread.AssigneesJSON)
 	}
-	if thread.GitHubID != "123" || thread.Number != 456 || thread.AuthorLogin != "" || thread.ClosedAtGitHub == "" {
+	if thread.GitHubID != "123" || thread.Number != 456 || thread.AuthorLogin != "" ||
+		thread.ClosedAtGitHub == "" || thread.MergedAtGitHub != "2026-05-05T11:30:00Z" {
 		t.Fatalf("thread = %+v", thread)
 	}
 }

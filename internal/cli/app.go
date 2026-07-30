@@ -169,6 +169,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.runFillPRDetails(ctx, rest[1:])
 	case "threads":
 		return a.runThreads(ctx, rest[1:])
+	case "capture":
+		return a.runCapture(ctx, rest[1:])
 	case "close-thread":
 		return a.runCloseThread(ctx, rest[1:])
 	case "reopen-thread":
@@ -4159,8 +4161,8 @@ func (a *App) runMetadata(args []string) error {
 		DefaultCache:    cfg.CacheDir,
 		DefaultLogs:     cfg.LogDir,
 	}
-	manifest.Capabilities = []string{"metadata", "status", "doctor", "sync", "coverage", "search", "code-index", "tui", "portable", "remote", "cloud-publish", "clusters", "summaries", "embeddings"}
-	manifest.Privacy = control.Privacy{ContainsPrivateMessages: false, ExportsSecrets: false, LocalOnlyScopes: []string{"github", "git", "sqlite", "portable"}}
+	manifest.Capabilities = []string{"metadata", "status", "doctor", "sync", "capture", "coverage", "search", "code-index", "tui", "portable", "remote", "cloud-publish", "clusters", "summaries", "embeddings"}
+	manifest.Privacy = control.Privacy{ContainsPrivateMessages: true, ExportsSecrets: false, LocalOnlyScopes: []string{"github", "git", "sqlite", "portable"}}
 	manifest.Commands = map[string]control.Command{
 		"status":          {Title: "Status", Argv: []string{"gitcrawl", "status", "--json"}, JSON: true},
 		"remote-status":   {Title: "Remote archive status", Argv: []string{"gitcrawl", "remote", "status", "--json"}, JSON: true},
@@ -4172,6 +4174,7 @@ func (a *App) runMetadata(args []string) error {
 		"doctor":          {Title: "Doctor", Argv: []string{"gitcrawl", "doctor", "--json"}, JSON: true},
 		"coverage":        {Title: "Archive coverage", Argv: []string{"gitcrawl", "coverage", "--json"}, JSON: true},
 		"sync":            {Title: "Sync repository", Argv: []string{"gitcrawl", "sync", "--json"}, JSON: true, Mutates: true},
+		"capture":         {Title: "Export conversation capture", Argv: []string{"gitcrawl", "capture", "--json"}, JSON: true},
 		"search":          {Title: "Search", Argv: []string{"gitcrawl", "search", "--json"}, JSON: true},
 		"code-index":      {Title: "Code index", Argv: []string{"gitcrawl", "code", "index", "--json"}, JSON: true, Mutates: true},
 		"tui":             {Title: "Terminal cluster browser", Argv: []string{"gitcrawl", "tui"}},
@@ -5125,6 +5128,7 @@ Core commands:
   summarize            generate key summaries for current thread revisions
   embed                generate OpenAI embeddings for local thread documents
   threads              list local issue and pull request rows
+  capture              export a stable code-free conversation snapshot
   code index           index tracked text files from a local Git checkout
   cluster              build durable clusters from local thread vectors
   close-thread         locally hide one issue or pull request row
@@ -5247,6 +5251,11 @@ Usage:
 
 Usage:
   gitcrawl threads owner/repo [--include-closed] [--numbers refs] [--limit N] [--json]
+`,
+	"capture": `gitcrawl capture exports a stable code-free conversation snapshot.
+
+Usage:
+  gitcrawl capture owner/repo [--schema gitcrawl.capture.v1] [--since RFC3339] [--output path] [--json]
 `,
 	"search": `gitcrawl search queries local thread documents, or accepts gh-shaped issue and PR search.
 

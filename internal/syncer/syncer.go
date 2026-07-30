@@ -346,7 +346,13 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 			var comments []store.Comment
 			if options.IncludeComments && childReservations[store.ThreadChildComments] {
 				var synced int
-				comments, synced, err = persistComments(ctx, st, thread, payload.commentRows)
+				comments, synced, err = persistComments(
+					ctx,
+					st,
+					thread,
+					payload.commentRows,
+					observationSequence,
+				)
 				if err != nil {
 					return err
 				}
@@ -691,6 +697,7 @@ func mapIssueToThread(repoID int64, row map[string]any, pulledAt string) store.T
 		CreatedAtGitHub:   stringValue(row["created_at"]),
 		UpdatedAtGitHub:   stringValue(row["updated_at"]),
 		ClosedAtGitHub:    stringValue(row["closed_at"]),
+		MergedAtGitHub:    stringValue(mapValue(row["pull_request"])["merged_at"]),
 		FirstPulledAt:     pulledAt,
 		LastPulledAt:      pulledAt,
 		UpdatedAt:         pulledAt,
@@ -794,17 +801,39 @@ func (s *Syncer) fetchCommentRows(ctx context.Context, options Options, threadKi
 	return rows, nil
 }
 
-func persistComments(ctx context.Context, st *store.Store, thread store.Thread, rows []commentRow) ([]store.Comment, int, error) {
+func persistComments(
+	ctx context.Context,
+	st *store.Store,
+	thread store.Thread,
+	rows []commentRow,
+	observationSequence int64,
+) ([]store.Comment, int, error) {
 	synced := 0
+	observedIDs := make([]int64, 0, len(rows))
 	for _, row := range rows {
 		comment := mapComment(thread.ID, row.kind, row.raw)
 		if comment.Body == "" && row.kind != "pull_review" && comment.DeletedAt == "" {
 			continue
 		}
-		if _, err := st.UpsertComment(ctx, comment); err != nil {
+		commentID, err := st.UpsertComment(ctx, comment)
+		if err != nil {
 			return nil, 0, err
 		}
+		if comment.DeletedAt == "" {
+			observedIDs = append(observedIDs, commentID)
+		}
 		synced++
+	}
+	if observationSequence > 0 {
+		if err := st.ReplaceThreadChildObservationMembers(
+			ctx,
+			thread.ID,
+			store.ThreadChildComments,
+			observationSequence,
+			observedIDs,
+		); err != nil {
+			return nil, 0, err
+		}
 	}
 	comments, err := st.ListComments(ctx, thread.ID)
 	if err != nil {

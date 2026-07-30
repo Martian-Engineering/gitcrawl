@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -147,6 +148,62 @@ func (s *Store) LastSuccessfulListSyncAt(ctx context.Context, repoID int64, stat
 		return time.Time{}, fmt.Errorf("parse last successful list sync %q: %w", lastSync, err)
 	}
 	return parsed, nil
+}
+
+// SuccessfulListSyncRuns returns complete non-targeted list runs from newest
+// to oldest for the requested state coverage.
+func (s *Store) SuccessfulListSyncRuns(
+	ctx context.Context,
+	repoID int64,
+	state string,
+) ([]RunRecord, error) {
+	state = normalizedListSyncState(state)
+	if state == "" {
+		return nil, fmt.Errorf("unsupported list sync state")
+	}
+	rows, err := s.q().QueryContext(ctx, `
+		select id, repo_id, scope, status, started_at, finished_at,
+			stats_json, error_text
+		from sync_runs
+		where repo_id = ?
+			and status in ('success', 'completed')
+			and (
+				(? = 'open' and scope in ('open', 'all')) or
+				(? = 'closed' and scope in ('closed', 'all')) or
+				(? = 'all' and scope = 'all')
+			)
+		order by finished_at desc, id desc
+	`, repoID, state, state, state)
+	if err != nil {
+		return nil, fmt.Errorf("list successful list sync runs: %w", err)
+	}
+	defer rows.Close()
+	var runs []RunRecord
+	for rows.Next() {
+		var run RunRecord
+		var finishedAt, statsJSON, errorText sql.NullString
+		if err := rows.Scan(
+			&run.ID,
+			&run.RepoID,
+			&run.Scope,
+			&run.Status,
+			&run.StartedAt,
+			&finishedAt,
+			&statsJSON,
+			&errorText,
+		); err != nil {
+			return nil, fmt.Errorf("scan successful list sync run: %w", err)
+		}
+		run.Kind = "sync"
+		run.FinishedAt = finishedAt.String
+		run.StatsJSON = statsJSON.String
+		run.ErrorText = errorText.String
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate successful list sync runs: %w", err)
+	}
+	return runs, nil
 }
 
 func normalizedListSyncState(state string) string {

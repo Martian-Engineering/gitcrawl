@@ -45,6 +45,7 @@ These work on every command.
 | `gitcrawl sync-failures owner/repo [--include-resolved --limit N --json]` | List failed PR hydration attempts and optional resolved history | [Sync](/sync/#hydration-depth) |
 | `gitcrawl coverage [owner/repo \| --repos owner/a,owner/b] [--min-missing-pr-details N --json]` | Report archive, PR-detail, and enrichment coverage/freshness | — |
 | `gitcrawl fill-pr-details owner/repo [--limit --order --batch-size --reserve-rate-limit --include-comments --json-progress --json]` | Hydrate locally missing pull request detail rows in bounded batches | — |
+| `gitcrawl capture owner/repo [--schema gitcrawl.capture.v1 --since RFC3339 --output path --json]` | Export a deterministic code-free conversation snapshot | [Conversation capture](/capture/) |
 | `gitcrawl refresh owner/repo [--with pr-details --no-sync --no-embed --no-cluster --strict-vectors ...]` | Wrapper that runs sync → embed → cluster | [Refresh and embed](/refresh-and-embed/) |
 | `gitcrawl embed owner/repo [--number <ref> --limit --force --include-closed --json]` | Generate OpenAI embeddings for thread documents | [Refresh and embed](/refresh-and-embed/#embed) |
 | `gitcrawl runs owner/repo [--kind sync\|embedding\|cluster --limit --json]` | List recorded run history | [Refresh and embed](/refresh-and-embed/#runs) |

@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -123,6 +125,157 @@ func (s *Store) ReserveThreadChildObservation(
 		return false, fmt.Errorf("reserve thread child observation %q: %w", family, err)
 	}
 	return true, nil
+}
+
+// ThreadChildObservation returns the source revision and sequence last reserved
+// for one family of a thread's child records.
+func (s *Store) ThreadChildObservation(
+	ctx context.Context,
+	threadID int64,
+	family ThreadChildObservationFamily,
+) (string, int64, bool, error) {
+	if threadID <= 0 {
+		return "", 0, false, fmt.Errorf("thread id must be positive")
+	}
+	if !validThreadChildObservationFamily(family) {
+		return "", 0, false, fmt.Errorf(
+			"unsupported thread child observation family %q",
+			family,
+		)
+	}
+	var sourceUpdatedAt string
+	var sequence int64
+	err := s.q().QueryRowContext(ctx, `
+		select source_updated_at, observation_sequence
+		from thread_child_observation_reservations
+		where thread_id = ? and family = ?
+	`, threadID, family).Scan(&sourceUpdatedAt, &sequence)
+	if err == sql.ErrNoRows {
+		return "", 0, false, nil
+	}
+	if err != nil {
+		return "", 0, false, fmt.Errorf(
+			"read thread child observation %q: %w",
+			family,
+			err,
+		)
+	}
+	return sourceUpdatedAt, sequence, true, nil
+}
+
+// ReplaceThreadChildObservationMembers records the exact database rows seen by
+// one completed child-family observation.
+func (s *Store) ReplaceThreadChildObservationMembers(
+	ctx context.Context,
+	threadID int64,
+	family ThreadChildObservationFamily,
+	sequence int64,
+	memberIDs []int64,
+) error {
+	if threadID <= 0 {
+		return fmt.Errorf("thread id must be positive")
+	}
+	if !validThreadChildObservationFamily(family) {
+		return fmt.Errorf("unsupported thread child observation family %q", family)
+	}
+	if sequence <= 0 {
+		return fmt.Errorf("observation sequence must be positive")
+	}
+	_, reservedSequence, found, err := s.ThreadChildObservation(ctx, threadID, family)
+	if err != nil {
+		return err
+	}
+	if !found || reservedSequence != sequence {
+		return fmt.Errorf(
+			"thread child observation %q is not reserved at sequence %d",
+			family,
+			sequence,
+		)
+	}
+	normalized := normalizedMemberIDs(memberIDs)
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return fmt.Errorf("marshal thread child observation %q members: %w", family, err)
+	}
+	if _, err := s.q().ExecContext(ctx, `
+		insert into thread_child_observation_memberships(
+			thread_id, family, observation_sequence, member_ids_json
+		)
+		values(?, ?, ?, ?)
+		on conflict(thread_id, family) do update set
+			observation_sequence = excluded.observation_sequence,
+			member_ids_json = excluded.member_ids_json
+	`, threadID, family, sequence, string(encoded)); err != nil {
+		return fmt.Errorf("replace thread child observation %q members: %w", family, err)
+	}
+	return nil
+}
+
+// ThreadChildObservationMemberIDs returns the exact member set recorded for an
+// observation sequence.
+func (s *Store) ThreadChildObservationMemberIDs(
+	ctx context.Context,
+	threadID int64,
+	family ThreadChildObservationFamily,
+	sequence int64,
+) ([]int64, bool, error) {
+	if threadID <= 0 {
+		return nil, false, fmt.Errorf("thread id must be positive")
+	}
+	if !validThreadChildObservationFamily(family) {
+		return nil, false, fmt.Errorf(
+			"unsupported thread child observation family %q",
+			family,
+		)
+	}
+	if sequence <= 0 {
+		return nil, false, fmt.Errorf("observation sequence must be positive")
+	}
+	var encoded string
+	err := s.q().QueryRowContext(ctx, `
+		select member_ids_json
+		from thread_child_observation_memberships
+		where thread_id = ? and family = ? and observation_sequence = ?
+	`, threadID, family, sequence).Scan(&encoded)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"read thread child observation %q members: %w",
+			family,
+			err,
+		)
+	}
+	var memberIDs []int64
+	if err := json.Unmarshal([]byte(encoded), &memberIDs); err != nil {
+		return nil, false, fmt.Errorf(
+			"decode thread child observation %q members: %w",
+			family,
+			err,
+		)
+	}
+	return normalizedMemberIDs(memberIDs), true, nil
+}
+
+// normalizedMemberIDs sorts positive database IDs and removes duplicates.
+func normalizedMemberIDs(memberIDs []int64) []int64 {
+	normalized := make([]int64, 0, len(memberIDs))
+	seen := make(map[int64]struct{}, len(memberIDs))
+	for _, memberID := range memberIDs {
+		if memberID <= 0 {
+			continue
+		}
+		if _, exists := seen[memberID]; exists {
+			continue
+		}
+		seen[memberID] = struct{}{}
+		normalized = append(normalized, memberID)
+	}
+	sort.Slice(normalized, func(left, right int) bool {
+		return normalized[left] < normalized[right]
+	})
+	return normalized
 }
 
 func validThreadChildObservationFamily(family ThreadChildObservationFamily) bool {

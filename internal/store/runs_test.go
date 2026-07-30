@@ -149,4 +149,15 @@ func TestLastSuccessfulListSyncAtIgnoresTargetedRuns(t *testing.T) {
 	if !lastSync.Equal(want) {
 		t.Fatalf("last broad sync = %s, want %s", lastSync, want)
 	}
+	runs, err := st.SuccessfulListSyncRuns(ctx, repoID, "all")
+	if err != nil {
+		t.Fatalf("list successful all-state runs: %v", err)
+	}
+	if len(runs) != 1 || runs[0].Scope != "all" ||
+		runs[0].FinishedAt != "2026-04-26T00:04:30Z" {
+		t.Fatalf("successful all-state runs = %+v", runs)
+	}
+	if _, err := st.SuccessfulListSyncRuns(ctx, repoID, "invalid"); err == nil {
+		t.Fatal("invalid list sync state succeeded")
+	}
 }
