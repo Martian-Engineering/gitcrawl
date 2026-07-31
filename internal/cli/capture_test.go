@@ -35,7 +35,7 @@ func TestCaptureCommandWritesV1Atomically(t *testing.T) {
 		Owner:        "openclaw",
 		Name:         "gitcrawl",
 		FullName:     "openclaw/gitcrawl",
-		GitHubRepoID: "R_1",
+		GitHubRepoID: "12345",
 		UpdatedAt:    "2026-07-30T20:00:00Z",
 	})
 	if err != nil {
@@ -94,7 +94,7 @@ func TestCaptureCommandWritesV1Atomically(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("decode capture: %v", err)
 	}
-	if got.Schema != capture.SchemaV1 || got.Repository.ID != "R_1" ||
+	if got.Schema != capture.SchemaV1 || got.Repository.ID != "12345" ||
 		got.RateLimit.Resource != "core" ||
 		got.RateLimit.Remaining != 37 ||
 		len(got.Threads) != 1 {
@@ -135,7 +135,7 @@ func TestCaptureCommandWritesJSONToStdout(t *testing.T) {
 	}
 	repoID, err := st.UpsertRepository(ctx, store.Repository{
 		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
-		GitHubRepoID: "R_1", UpdatedAt: "2026-07-30T20:00:00Z",
+		GitHubRepoID: "12345", UpdatedAt: "2026-07-30T20:00:00Z",
 	})
 	if err != nil {
 		t.Fatalf("upsert repository: %v", err)

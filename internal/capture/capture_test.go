@@ -22,7 +22,7 @@ func TestBuildExportsDeterministicCodeFreeThreads(t *testing.T) {
 		Owner:        "openclaw",
 		Name:         "gitcrawl",
 		FullName:     "openclaw/gitcrawl",
-		GitHubRepoID: "R_1",
+		GitHubRepoID: "12345",
 		RawJSON:      `{"private":"repository-raw-marker"}`,
 		UpdatedAt:    "2026-07-30T20:00:00Z",
 	})
@@ -149,7 +149,7 @@ func TestBuildExportsDeterministicCodeFreeThreads(t *testing.T) {
 	if string(firstJSON) != string(secondJSON) {
 		t.Fatalf("capture changed without source changes:\n%s\n%s", firstJSON, secondJSON)
 	}
-	if first.Schema != SchemaV1 || first.Repository.ID != "R_1" ||
+	if first.Schema != SchemaV1 || first.Repository.ID != "12345" ||
 		first.SyncedAt != "2026-07-30T20:00:00Z" ||
 		first.RateLimit.Resource != "core" ||
 		first.RateLimit.Remaining != 37 ||
@@ -211,7 +211,19 @@ func TestBuildRequiresStableRepositoryIdentityAndSuccessfulSync(t *testing.T) {
 		t.Fatalf("missing repository identity error = %v", err)
 	}
 	if _, err := st.DB().ExecContext(ctx, `
-		update repositories set github_repo_id = 'R_1'
+		update repositories set github_repo_id = 'R_kgDOQcTrdw'
+		where full_name = 'openclaw/gitcrawl'
+	`); err != nil {
+		t.Fatalf("add invalid repository identity: %v", err)
+	}
+	if _, err := Build(
+		ctx, st, "openclaw/gitcrawl", "test", testRateLimit(), "",
+	); err == nil ||
+		!strings.Contains(err.Error(), "invalid GitHub repository id") {
+		t.Fatalf("invalid repository identity error = %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		update repositories set github_repo_id = '12345'
 		where full_name = 'openclaw/gitcrawl'
 	`); err != nil {
 		t.Fatalf("add repository identity: %v", err)
@@ -263,7 +275,7 @@ func TestBuildRequiresCurrentCommentObservationForEveryThread(t *testing.T) {
 	defer st.Close()
 	repoID, err := st.UpsertRepository(ctx, store.Repository{
 		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
-		GitHubRepoID: "R_1", UpdatedAt: "2026-07-30T20:00:00Z",
+		GitHubRepoID: "12345", UpdatedAt: "2026-07-30T20:00:00Z",
 	})
 	if err != nil {
 		t.Fatalf("upsert repository: %v", err)
@@ -386,7 +398,7 @@ func TestBuildFiltersSinceAndRejectsMalformedSourceData(t *testing.T) {
 		Owner:        "openclaw",
 		Name:         "gitcrawl",
 		FullName:     "openclaw/gitcrawl",
-		GitHubRepoID: "R_1",
+		GitHubRepoID: "12345",
 		UpdatedAt:    "2026-07-30T20:00:00Z",
 	})
 	if err != nil {

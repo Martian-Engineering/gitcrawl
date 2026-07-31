@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -125,6 +126,12 @@ func buildSnapshot(
 	if strings.TrimSpace(repository.GitHubRepoID) == "" {
 		return Capture{}, fmt.Errorf(
 			"capture repository %s has no stable GitHub repository id",
+			fullName,
+		)
+	}
+	if _, err := strconv.ParseUint(repository.GitHubRepoID, 10, 64); err != nil {
+		return Capture{}, fmt.Errorf(
+			"capture repository %s has an invalid GitHub repository id",
 			fullName,
 		)
 	}
