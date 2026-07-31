@@ -22,8 +22,19 @@ type Capture struct {
 	Schema          string            `json:"schema"`
 	ProducerVersion string            `json:"producer_version"`
 	Repository      CaptureRepository `json:"repository"`
+	RateLimit       RateLimit         `json:"rate_limit"`
 	SyncedAt        string            `json:"synced_at"`
 	Threads         []Thread          `json:"threads"`
+}
+
+// RateLimit is one sanitized GitHub quota observation.
+type RateLimit struct {
+	Resource          string  `json:"resource"`
+	Limit             int     `json:"limit"`
+	Remaining         int     `json:"remaining"`
+	ResetAt           *string `json:"reset_at"`
+	ObservedAt        string  `json:"observed_at"`
+	RetryAfterSeconds *int    `json:"retry_after_seconds"`
 }
 
 // CaptureRepository identifies the exact GitHub repository in a capture.
@@ -76,12 +87,23 @@ func Build(
 	st *store.Store,
 	fullName string,
 	producerVersion string,
+	rateLimit RateLimit,
 	since string,
 ) (Capture, error) {
+	if err := validateRateLimit(rateLimit); err != nil {
+		return Capture{}, err
+	}
 	var result Capture
 	err := st.WithTx(ctx, func(snapshot *store.Store) error {
 		var err error
-		result, err = buildSnapshot(ctx, snapshot, fullName, producerVersion, since)
+		result, err = buildSnapshot(
+			ctx,
+			snapshot,
+			fullName,
+			producerVersion,
+			rateLimit,
+			since,
+		)
 		return err
 	})
 	return result, err
@@ -93,6 +115,7 @@ func buildSnapshot(
 	st *store.Store,
 	fullName string,
 	producerVersion string,
+	rateLimit RateLimit,
 	since string,
 ) (Capture, error) {
 	repository, err := st.RepositoryByFullName(ctx, fullName)
@@ -150,9 +173,32 @@ func buildSnapshot(
 			ID:       repository.GitHubRepoID,
 			FullName: repository.FullName,
 		},
-		SyncedAt: syncedAt.UTC().Format(time.RFC3339Nano),
-		Threads:  threads,
+		RateLimit: rateLimit,
+		SyncedAt:  syncedAt.UTC().Format(time.RFC3339Nano),
+		Threads:   threads,
 	}, nil
+}
+
+func validateRateLimit(rateLimit RateLimit) error {
+	if strings.TrimSpace(rateLimit.Resource) == "" ||
+		rateLimit.Limit < 0 ||
+		rateLimit.Remaining < 0 ||
+		rateLimit.Remaining > rateLimit.Limit {
+		return fmt.Errorf("capture rate limit observation is invalid")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, rateLimit.ObservedAt); err != nil {
+		return fmt.Errorf("capture rate limit observation time is invalid")
+	}
+	if rateLimit.ResetAt != nil {
+		if _, err := time.Parse(time.RFC3339Nano, *rateLimit.ResetAt); err != nil {
+			return fmt.Errorf("capture rate limit reset time is invalid")
+		}
+	}
+	if rateLimit.RetryAfterSeconds != nil &&
+		(*rateLimit.RetryAfterSeconds < 0 || *rateLimit.RetryAfterSeconds > 86400) {
+		return fmt.Errorf("capture rate limit retry guidance is invalid")
+	}
+	return nil
 }
 
 // captureSyncAt selects the newest successful all-state list run whose bounds

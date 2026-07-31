@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openclaw/gitcrawl/internal/capture"
 	"github.com/openclaw/gitcrawl/internal/config"
+	gh "github.com/openclaw/gitcrawl/internal/github"
 	"github.com/openclaw/gitcrawl/internal/store"
 )
 
@@ -21,6 +23,7 @@ func TestCaptureCommandWritesV1Atomically(t *testing.T) {
 	dbPath := filepath.Join(root, "gitcrawl.db")
 	cfg := config.Default()
 	cfg.DBPath = dbPath
+	cfg.CacheDir = filepath.Join(root, "cache")
 	if err := config.Save(configPath, cfg); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
@@ -74,7 +77,8 @@ func TestCaptureCommandWritesV1Atomically(t *testing.T) {
 	}
 
 	outputPath := filepath.Join(root, "captures", "capture.json")
-	if err := New().Run(ctx, []string{
+	app := seedCaptureRateLimit(t, ctx, configPath)
+	if err := app.Run(ctx, []string{
 		"--config", configPath,
 		"capture", "openclaw/gitcrawl",
 		"--schema", capture.SchemaV1,
@@ -91,6 +95,8 @@ func TestCaptureCommandWritesV1Atomically(t *testing.T) {
 		t.Fatalf("decode capture: %v", err)
 	}
 	if got.Schema != capture.SchemaV1 || got.Repository.ID != "R_1" ||
+		got.RateLimit.Resource != "core" ||
+		got.RateLimit.Remaining != 37 ||
 		len(got.Threads) != 1 {
 		t.Fatalf("capture = %+v", got)
 	}
@@ -119,6 +125,7 @@ func TestCaptureCommandWritesJSONToStdout(t *testing.T) {
 	dbPath := filepath.Join(root, "gitcrawl.db")
 	cfg := config.Default()
 	cfg.DBPath = dbPath
+	cfg.CacheDir = filepath.Join(root, "cache")
 	if err := config.Save(configPath, cfg); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
@@ -143,7 +150,7 @@ func TestCaptureCommandWritesJSONToStdout(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
-	app := New()
+	app := seedCaptureRateLimit(t, ctx, configPath)
 	var stdout bytes.Buffer
 	app.Stdout = &stdout
 	if err := app.Run(ctx, []string{
@@ -158,6 +165,27 @@ func TestCaptureCommandWritesJSONToStdout(t *testing.T) {
 	if got.Schema != capture.SchemaV1 || got.Threads == nil {
 		t.Fatalf("stdout capture = %+v", got)
 	}
+}
+
+func seedCaptureRateLimit(
+	t *testing.T,
+	ctx context.Context,
+	configPath string,
+) *App {
+	t.Helper()
+	const token = "capture-test-token"
+	t.Setenv(config.DefaultTokenEnv, token)
+	app := New()
+	app.configPath = configPath
+	if err := app.writeSharedRateLimit(ctx, token, gh.RateLimitSnapshot{
+		Limit:     5000,
+		Remaining: 37,
+		ResetAt:   time.Now().UTC().Add(time.Hour),
+		Resource:  "core",
+	}, "capture test"); err != nil {
+		t.Fatalf("write capture rate limit: %v", err)
+	}
+	return app
 }
 
 func TestWriteCaptureAtomicallyRejectsEmptyOutput(t *testing.T) {

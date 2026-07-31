@@ -126,11 +126,15 @@ func TestBuildExportsDeterministicCodeFreeThreads(t *testing.T) {
 		t.Fatalf("record newer limited sync: %v", err)
 	}
 
-	first, err := Build(ctx, st, "openclaw/gitcrawl", "v0.8.8-test", "")
+	first, err := Build(
+		ctx, st, "openclaw/gitcrawl", "v0.8.8-test", testRateLimit(), "",
+	)
 	if err != nil {
 		t.Fatalf("build capture: %v", err)
 	}
-	second, err := Build(ctx, st, "openclaw/gitcrawl", "v0.8.8-test", "")
+	second, err := Build(
+		ctx, st, "openclaw/gitcrawl", "v0.8.8-test", testRateLimit(), "",
+	)
 	if err != nil {
 		t.Fatalf("rebuild capture: %v", err)
 	}
@@ -146,7 +150,10 @@ func TestBuildExportsDeterministicCodeFreeThreads(t *testing.T) {
 		t.Fatalf("capture changed without source changes:\n%s\n%s", firstJSON, secondJSON)
 	}
 	if first.Schema != SchemaV1 || first.Repository.ID != "R_1" ||
-		first.SyncedAt != "2026-07-30T20:00:00Z" || len(first.Threads) != 1 {
+		first.SyncedAt != "2026-07-30T20:00:00Z" ||
+		first.RateLimit.Resource != "core" ||
+		first.RateLimit.Remaining != 37 ||
+		len(first.Threads) != 1 {
 		t.Fatalf("capture metadata = %+v", first)
 	}
 	got := first.Threads[0]
@@ -170,6 +177,17 @@ func TestBuildExportsDeterministicCodeFreeThreads(t *testing.T) {
 	}
 }
 
+func testRateLimit() RateLimit {
+	resetAt := "2026-07-30T22:00:00Z"
+	return RateLimit{
+		Resource:   "core",
+		Limit:      5000,
+		Remaining:  37,
+		ResetAt:    &resetAt,
+		ObservedAt: "2026-07-30T21:00:00Z",
+	}
+}
+
 func TestBuildRequiresStableRepositoryIdentityAndSuccessfulSync(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
@@ -186,7 +204,9 @@ func TestBuildRequiresStableRepositoryIdentityAndSuccessfulSync(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("upsert repository: %v", err)
 	}
-	if _, err := Build(ctx, st, "openclaw/gitcrawl", "test", ""); err == nil ||
+	if _, err := Build(
+		ctx, st, "openclaw/gitcrawl", "test", testRateLimit(), "",
+	); err == nil ||
 		!strings.Contains(err.Error(), "stable GitHub repository id") {
 		t.Fatalf("missing repository identity error = %v", err)
 	}
@@ -196,7 +216,9 @@ func TestBuildRequiresStableRepositoryIdentityAndSuccessfulSync(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("add repository identity: %v", err)
 	}
-	if _, err := Build(ctx, st, "openclaw/gitcrawl", "test", ""); err == nil ||
+	if _, err := Build(
+		ctx, st, "openclaw/gitcrawl", "test", testRateLimit(), "",
+	); err == nil ||
 		!strings.Contains(err.Error(), "unbounded all-state list sync") {
 		t.Fatalf("missing sync error = %v", err)
 	}
@@ -211,7 +233,9 @@ func TestBuildRequiresStableRepositoryIdentityAndSuccessfulSync(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("record metadata-only sync: %v", err)
 	}
-	if _, err := Build(ctx, st, "openclaw/gitcrawl", "test", ""); err == nil ||
+	if _, err := Build(
+		ctx, st, "openclaw/gitcrawl", "test", testRateLimit(), "",
+	); err == nil ||
 		!strings.Contains(err.Error(), "unbounded all-state list sync") {
 		t.Fatalf("targeted sync freshness error = %v", err)
 	}
@@ -221,7 +245,9 @@ func TestBuildRequiresStableRepositoryIdentityAndSuccessfulSync(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("record all-state sync: %v", err)
 	}
-	result, err := Build(ctx, st, "openclaw/gitcrawl", "test", "")
+	result, err := Build(
+		ctx, st, "openclaw/gitcrawl", "test", testRateLimit(), "",
+	)
 	if err != nil || len(result.Threads) != 0 ||
 		result.SyncedAt != "2026-07-30T20:02:00Z" {
 		t.Fatalf("empty repository capture = %+v, %v", result, err)
@@ -260,17 +286,23 @@ func TestBuildRequiresCurrentCommentObservationForEveryThread(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("record sync: %v", err)
 	}
-	if _, err := Build(ctx, st, "openclaw/gitcrawl", "test", ""); err == nil ||
+	if _, err := Build(
+		ctx, st, "openclaw/gitcrawl", "test", testRateLimit(), "",
+	); err == nil ||
 		!strings.Contains(err.Error(), "no complete comment observation") {
 		t.Fatalf("missing comment observation error = %v", err)
 	}
 	reserveComments(t, ctx, st, thread.ID, "2026-07-30T18:00:00Z")
-	if _, err := Build(ctx, st, "openclaw/gitcrawl", "test", ""); err == nil ||
+	if _, err := Build(
+		ctx, st, "openclaw/gitcrawl", "test", testRateLimit(), "",
+	); err == nil ||
 		!strings.Contains(err.Error(), "current source revision") {
 		t.Fatalf("stale comment observation error = %v", err)
 	}
 	reserveComments(t, ctx, st, thread.ID, thread.UpdatedAtGitHub)
-	if _, err := Build(ctx, st, "openclaw/gitcrawl", "test", ""); err != nil {
+	if _, err := Build(
+		ctx, st, "openclaw/gitcrawl", "test", testRateLimit(), "",
+	); err != nil {
 		t.Fatalf("capture current comment observation: %v", err)
 	}
 }
@@ -399,6 +431,7 @@ func TestBuildFiltersSinceAndRejectsMalformedSourceData(t *testing.T) {
 		st,
 		"openclaw/gitcrawl",
 		"test",
+		testRateLimit(),
 		"2026-07-15T00:00:00Z",
 	)
 	if err != nil {
@@ -412,6 +445,7 @@ func TestBuildFiltersSinceAndRejectsMalformedSourceData(t *testing.T) {
 		st,
 		"openclaw/gitcrawl",
 		"test",
+		testRateLimit(),
 		"not-a-time",
 	); err == nil || !strings.Contains(err.Error(), "capture since") {
 		t.Fatalf("invalid since error = %v", err)
@@ -421,7 +455,9 @@ func TestBuildFiltersSinceAndRejectsMalformedSourceData(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("corrupt source timestamp: %v", err)
 	}
-	if _, err := Build(ctx, st, "openclaw/gitcrawl", "test", ""); err == nil ||
+	if _, err := Build(
+		ctx, st, "openclaw/gitcrawl", "test", testRateLimit(), "",
+	); err == nil ||
 		!strings.Contains(err.Error(), "thread #2 updated_at") {
 		t.Fatalf("invalid source timestamp error = %v", err)
 	}

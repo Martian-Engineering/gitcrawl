@@ -58,6 +58,7 @@ The top-level object contains:
 - `schema`;
 - `producer_version`;
 - the repository's stable GitHub ID and current `owner/name`;
+- `rate_limit`, the last observation made by the same token during sync;
 - `synced_at`, taken from the latest successful local sync;
 - issues and pull requests ordered by number and kind.
 
@@ -71,6 +72,13 @@ changes when exported thread or comment content changes.
 Repository metadata, sync metadata, threads, and comments are read from one
 SQLite transaction so a concurrent sync cannot mix archive generations in one
 capture.
+
+`rate_limit` contains only `resource`, `limit`, `remaining`, `reset_at`,
+`observed_at`, and nullable `retry_after_seconds`. It never contains the token,
+token hash, host, headers, response body, or stderr. Capture resolves the same
+token used by the preceding sync only to select its private local observation;
+the token does not enter the output. The command fails if that observation is
+unavailable.
 
 ## Privacy boundary
 

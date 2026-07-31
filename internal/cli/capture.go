@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/openclaw/gitcrawl/internal/capture"
 )
@@ -47,11 +48,16 @@ func (a *App) runCapture(ctx context.Context, args []string) error {
 		return err
 	}
 	defer rt.Store.Close()
+	rateLimit, err := a.captureRateLimit(ctx)
+	if err != nil {
+		return err
+	}
 	result, err := capture.Build(
 		ctx,
 		rt.Store,
 		owner+"/"+repoName,
 		version,
+		rateLimit,
 		*since,
 	)
 	if err != nil {
@@ -67,6 +73,29 @@ func (a *App) runCapture(ctx context.Context, args []string) error {
 		return err
 	}
 	return writeCaptureAtomically(*output, data)
+}
+
+func (a *App) captureRateLimit(
+	ctx context.Context,
+) (capture.RateLimit, error) {
+	state, ok := a.sharedRateLimitState(ctx)
+	if !ok {
+		return capture.RateLimit{}, fmt.Errorf(
+			"capture rate limit observation is unavailable; run sync with the same GitHub token first",
+		)
+	}
+	var resetAt *string
+	if !state.ResetAt.IsZero() {
+		formatted := state.ResetAt.UTC().Format(time.RFC3339Nano)
+		resetAt = &formatted
+	}
+	return capture.RateLimit{
+		Resource:   state.Resource,
+		Limit:      state.Limit,
+		Remaining:  state.Remaining,
+		ResetAt:    resetAt,
+		ObservedAt: state.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	}, nil
 }
 
 // writeCaptureAtomically publishes a private file without a partial target.
