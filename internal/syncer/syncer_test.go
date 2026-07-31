@@ -1363,12 +1363,17 @@ func TestSyncPersistsIssuesAndPullRequests(t *testing.T) {
 	s := New(fakeGitHub{}, st)
 	s.now = func() time.Time { return time.Date(2026, 4, 26, 0, 0, 0, 0, time.UTC) }
 	var progressLogs bytes.Buffer
+	var snapshots []SyncProgress
 	stats, err := s.Sync(ctx, Options{
 		Owner:            "openclaw",
 		Repo:             "gitcrawl",
 		IncludeComments:  true,
 		IncludePRDetails: true,
 		Logger:           testProgressLogger(&progressLogs),
+		Progress: func(snapshot SyncProgress) error {
+			snapshots = append(snapshots, snapshot)
+			return nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("sync: %v", err)
@@ -1384,6 +1389,18 @@ func TestSyncPersistsIssuesAndPullRequests(t *testing.T) {
 	}
 	if stats.MetadataOnly {
 		t.Fatal("metadata only: got true want false")
+	}
+	if len(snapshots) < 4 {
+		t.Fatalf("progress snapshots = %+v", snapshots)
+	}
+	if snapshots[0].Stage != SyncProgressConnecting {
+		t.Fatalf("initial progress = %+v", snapshots[0])
+	}
+	if got := snapshots[len(snapshots)-1]; got.Stage != SyncProgressFinalizing ||
+		got.IssuesReceived != 1 ||
+		got.PullRequestsReceived != 1 ||
+		got.CommentsReceived != 1 {
+		t.Fatalf("terminal progress = %+v", got)
 	}
 
 	repo, err := st.RepositoryByFullName(ctx, "openclaw/gitcrawl")

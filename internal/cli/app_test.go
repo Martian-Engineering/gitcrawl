@@ -6281,6 +6281,7 @@ func TestSyncCommandUsesConfiguredGitHubBaseURLAndHydratesComments(t *testing.T)
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
 	dbPath := filepath.Join(dir, "gitcrawl.db")
+	progressPath := filepath.Join(dir, "sync-progress.json")
 	init := New()
 	if err := init.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
 		t.Fatalf("init: %v", err)
@@ -6318,7 +6319,14 @@ func TestSyncCommandUsesConfiguredGitHubBaseURLAndHydratesComments(t *testing.T)
 	run := New()
 	var stdout bytes.Buffer
 	run.Stdout = &stdout
-	if err := run.Run(ctx, []string{"--config", configPath, "sync", "openclaw/openclaw", "--numbers", "101,102", "--include-comments", "--json"}); err != nil {
+	if err := run.Run(ctx, []string{
+		"--config", configPath,
+		"sync", "openclaw/openclaw",
+		"--numbers", "101,102",
+		"--include-comments",
+		"--progress-file", progressPath,
+		"--json",
+	}); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
 	var stats struct {
@@ -6337,6 +6345,24 @@ func TestSyncCommandUsesConfiguredGitHubBaseURLAndHydratesComments(t *testing.T)
 	if stats.DBTarget != "direct" || stats.DBTargetPath != dbPath {
 		t.Fatalf("sync db target = %+v", stats)
 	}
+	progressData, err := os.ReadFile(progressPath)
+	if err != nil {
+		t.Fatalf("read sync progress: %v", err)
+	}
+	var syncProgress syncProgressSnapshot
+	if err := json.Unmarshal(progressData, &syncProgress); err != nil {
+		t.Fatalf("decode sync progress: %v", err)
+	}
+	if syncProgress.Schema != syncProgressSchemaV1 ||
+		syncProgress.Repository != "openclaw/openclaw" ||
+		syncProgress.State != syncProgressSucceeded ||
+		syncProgress.Stage != syncProgressFinalizing ||
+		syncProgress.IssuesReceived != 1 ||
+		syncProgress.PullRequestsReceived != 1 ||
+		syncProgress.CommentsReceived != 4 ||
+		syncProgress.ObservedAt == "" {
+		t.Fatalf("sync progress = %+v", syncProgress)
+	}
 
 	st, err := store.Open(ctx, dbPath)
 	if err != nil {
@@ -6349,6 +6375,53 @@ func TestSyncCommandUsesConfiguredGitHubBaseURLAndHydratesComments(t *testing.T)
 	}
 	if status.ThreadCount != 2 || status.RepositoryCount != 1 {
 		t.Fatalf("status after sync = %+v", status)
+	}
+}
+
+func TestSyncCommandPublishesSanitizedFailureProgress(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	progressPath := filepath.Join(dir, "sync-progress.json")
+	if err := New().Run(ctx, []string{
+		"--config", configPath, "init", "--db", dbPath,
+	}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		http.Error(w, "private upstream diagnostic", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "test-gh-token")
+	t.Setenv("GITCRAWL_GITHUB_BASE_URL", server.URL)
+
+	err := New().Run(ctx, []string{
+		"--config", configPath,
+		"sync", "openclaw/gitcrawl",
+		"--progress-file", progressPath,
+	})
+	if err == nil {
+		t.Fatal("sync unexpectedly succeeded")
+	}
+	data, readErr := os.ReadFile(progressPath)
+	if readErr != nil {
+		t.Fatalf("read progress: %v", readErr)
+	}
+	var progress syncProgressSnapshot
+	if err := json.Unmarshal(data, &progress); err != nil {
+		t.Fatalf("decode progress: %v", err)
+	}
+	if progress.State != syncProgressFailed ||
+		progress.Stage != syncProgressConnecting {
+		t.Fatalf("failure progress = %+v", progress)
+	}
+	if strings.Contains(string(data), "diagnostic") ||
+		strings.Contains(string(data), "test-gh-token") {
+		t.Fatalf("failure progress retained sensitive data: %s", data)
 	}
 }
 

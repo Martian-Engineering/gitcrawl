@@ -82,6 +82,7 @@ issue or pull request URLs.
 | `--include-comments` | Issue comments, PR review comments, reviews |
 | `--include-pr-details` | PR files, commits, status checks, workflow runs |
 | `--with pr-details` | Same as `--include-pr-details` (gh-style flag) |
+| `--progress-file <absolute-path>` | Atomically publish sanitized machine-readable activity |
 
 PR details land in `pr_files`, `pr_commits`, `pr_checks`, and `pr_runs` tables for local review, search, clustering, and TUI workflows.
 
@@ -90,6 +91,30 @@ Use `gitcrawl coverage [owner/repo] --json` to inspect archive completeness afte
 `gitcrawl sync-failures owner/repo --json` lists unresolved PR hydration failures with their operation, error class and message, timestamps, and retry count. Add `--include-resolved` to inspect failures cleared by a later successful hydration. This operational ledger stays local when `portable prune` runs unless the publisher explicitly passes `--include-sync-failures`, which retains the ledger only after replacing every error message with a redaction marker.
 
 `--include-code` is accepted for compatibility but is currently a no-op.
+
+## Machine-readable progress
+
+Automation may pass an absolute `--progress-file` path. Gitcrawl atomically
+replaces that private file as synchronization advances, then leaves the
+terminal snapshot in place:
+
+```json
+{
+  "schema": "gitcrawl.sync-progress.v1",
+  "repository": "owner/repo",
+  "state": "running",
+  "stage": "syncing_threads",
+  "issues_received": 56,
+  "pull_requests_received": 238,
+  "comments_received": 350,
+  "observed_at": "2026-07-31T04:17:36.000000000Z"
+}
+```
+
+`state` is `running`, `succeeded`, or `failed`; `stage` is `connecting`,
+`syncing_threads`, or `finalizing`. Counts describe upstream activity observed
+by the current process, not rows committed to SQLite. The snapshot never
+contains credentials, issue content, request URLs, or raw diagnostics.
 
 ## Limit and pagination
 

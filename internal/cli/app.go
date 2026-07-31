@@ -2884,8 +2884,9 @@ func (a *App) runSync(ctx context.Context, args []string) error {
 	includeComments := fs.Bool("include-comments", false, "hydrate issue comments, PR reviews, and PR review comments")
 	includePRDetails := fs.Bool("include-pr-details", false, "hydrate PR files, commits, checks, and workflow runs")
 	withRaw := fs.String("with", "", "extra hydration: pr-details")
+	progressFile := fs.String("progress-file", "", "write an atomic sanitized sync progress snapshot")
 	fs.Bool("include-code", false, "accepted for compatibility; code hydration is not implemented yet")
-	if err := fs.Parse(normalizeCommandArgs(args, map[string]bool{"numbers": true, "since": true, "state": true, "limit": true, "with": true})); err != nil {
+	if err := fs.Parse(normalizeCommandArgs(args, map[string]bool{"numbers": true, "since": true, "state": true, "limit": true, "with": true, "progress-file": true})); err != nil {
 		return usageErr(err)
 	}
 	a.applyCommandJSON(*jsonOut)
@@ -2908,6 +2909,18 @@ func (a *App) runSync(ctx context.Context, args []string) error {
 	if err != nil {
 		return usageErr(err)
 	}
+	progress, err := newSyncProgressWriter(
+		*progressFile,
+		owner+"/"+repo,
+	)
+	if err != nil {
+		return usageErr(err)
+	}
+	if err := progress.report(syncer.SyncProgress{
+		Stage: syncer.SyncProgressConnecting,
+	}); err != nil {
+		return err
+	}
 
 	stats, target, err := a.syncRepository(ctx, owner, repo, syncOptions{
 		Since:            strings.TrimSpace(*since),
@@ -2916,8 +2929,15 @@ func (a *App) runSync(ctx context.Context, args []string) error {
 		Numbers:          numbers,
 		IncludeComments:  *includeComments,
 		IncludePRDetails: *includePRDetails || with["pr-details"],
+		Progress:         progress.report,
 	})
 	if err != nil {
+		if progressErr := progress.finish(syncProgressFailed); progressErr != nil {
+			return progressErr
+		}
+		return err
+	}
+	if err := progress.finish(syncProgressSucceeded); err != nil {
 		return err
 	}
 	result := struct {
@@ -2936,6 +2956,7 @@ type syncOptions struct {
 	IncludePRDetails bool
 	Quiet            bool
 	RateLimitReserve int
+	Progress         syncer.SyncProgressReporter
 }
 
 type fillPRDetailsResult struct {
@@ -3241,6 +3262,7 @@ func (a *App) syncRepository(ctx context.Context, owner, repo string, options sy
 		IncludePRDetails: options.IncludePRDetails,
 		Reporter:         reporter,
 		Logger:           logger,
+		Progress:         options.Progress,
 	})
 	if err != nil {
 		return syncer.Stats{}, target, err

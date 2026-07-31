@@ -51,6 +51,7 @@ type Options struct {
 	IncludePRDetails bool
 	Reporter         gh.Reporter
 	Logger           *slog.Logger
+	Progress         SyncProgressReporter
 }
 
 type Stats struct {
@@ -116,6 +117,11 @@ func New(client GitHubClient, st *store.Store) *Syncer {
 
 func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 	started := s.now().Format(time.RFC3339Nano)
+	if err := reportSyncProgress(options.Progress, SyncProgress{
+		Stage: SyncProgressConnecting,
+	}); err != nil {
+		return Stats{}, err
+	}
 	since, err := normalizeSince(options.Since, s.now())
 	if err != nil {
 		return Stats{}, err
@@ -160,6 +166,10 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 		}
 		rows = mergeIssueRows(rows, closedOverlapRows)
 	}
+	received := receivedThreadCounts(rows)
+	if err := reportSyncProgress(options.Progress, received); err != nil {
+		return Stats{}, err
+	}
 	closedOverlapNumbers := make(map[int]struct{}, len(closedOverlapRows))
 	for _, row := range closedOverlapRows {
 		closedOverlapNumbers[intValue(row["number"])] = struct{}{}
@@ -177,6 +187,7 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 				return Stats{}, err
 			}
 			payload.commentRows = commentRows
+			received.CommentsReceived += len(commentRows)
 		}
 		if options.IncludePRDetails && kind == "pull_request" {
 			reviewThreads, reviewThreadsFetchedAt, err := s.fetchPullReviewThreadRows(ctx, options, number)
@@ -201,6 +212,9 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 			payload.hasPullDetails = true
 		}
 		payloads = append(payloads, payload)
+		if err := reportSyncProgress(options.Progress, received); err != nil {
+			return Stats{}, err
+		}
 	}
 	if err := s.consolidateWorkflowSnapshots(ctx, options, payloads); err != nil {
 		return Stats{}, err
@@ -218,6 +232,10 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 	}
 	if s.beforePersist != nil {
 		s.beforePersist()
+	}
+	received.Stage = SyncProgressFinalizing
+	if err := reportSyncProgress(options.Progress, received); err != nil {
+		return Stats{}, err
 	}
 	stats := Stats{
 		Repository:     options.Owner + "/" + options.Repo,
@@ -480,6 +498,28 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 	applySyncPersistStats(&stats, persisted)
 	tracker.Finish(nil)
 	return stats, nil
+}
+
+func receivedThreadCounts(rows []map[string]any) SyncProgress {
+	result := SyncProgress{Stage: SyncProgressThreads}
+	for _, row := range rows {
+		if issueKind(row) == "pull_request" {
+			result.PullRequestsReceived++
+		} else {
+			result.IssuesReceived++
+		}
+	}
+	return result
+}
+
+func reportSyncProgress(
+	reporter SyncProgressReporter,
+	snapshot SyncProgress,
+) error {
+	if reporter == nil {
+		return nil
+	}
+	return reporter(snapshot)
 }
 
 func (s *Syncer) recordPullRequestSyncFailure(ctx context.Context, options Options, repoRaw, row map[string]any, operation string, syncErr error) error {
