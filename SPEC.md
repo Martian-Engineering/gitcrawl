@@ -141,7 +141,9 @@ config when the new platform config path does not exist.
 Path selection is intentionally incremental: existing legacy config, database,
 cache, vector, and log paths are reused per component only while the matching
 new platform path does not exist. Explicit `--config`, `GITCRAWL_CONFIG`,
-`GITCRAWL_DB_PATH`, and configured portable-store paths remain authoritative.
+`GITCRAWL_DB_PATH`, and configured portable-store paths remain authoritative;
+database paths are durable filesystem paths, never SQLite `file:` URIs or
+`:memory:` databases.
 
 Primary environment variables:
 

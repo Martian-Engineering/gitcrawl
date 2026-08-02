@@ -1964,7 +1964,9 @@ func (a *App) runTUI(ctx context.Context, args []string) error {
 			if cfgErr := cfg.Normalize(); cfgErr != nil {
 				return cfgErr
 			}
-			cfg.ApplyRuntimeEnv()
+			if cfgErr := cfg.ApplyRuntimeEnv(); cfgErr != nil {
+				return cfgErr
+			}
 			sort, sortErr := resolveTUISort(*sortMode, cfg)
 			if sortErr != nil {
 				return sortErr
@@ -3867,7 +3869,9 @@ func (a *App) runDoctor(ctx context.Context, args []string) error {
 		if err := cfg.Normalize(); err != nil {
 			return err
 		}
-		cfg.ApplyRuntimeEnv()
+		if err := cfg.ApplyRuntimeEnv(); err != nil {
+			return err
+		}
 	}
 	if cfg.Remote.Enabled() && cfg.Remote.Mode == crawlremote.ModeCloud {
 		return a.runRemoteDoctor(ctx, cfg, configExists)
@@ -4228,7 +4232,9 @@ func (a *App) runStatus(ctx context.Context, args []string) error {
 		if err := cfg.Normalize(); err != nil {
 			return err
 		}
-		cfg.ApplyRuntimeEnv()
+		if err := cfg.ApplyRuntimeEnv(); err != nil {
+			return err
+		}
 	}
 	if cfg.Remote.Enabled() && cfg.Remote.Mode == crawlremote.ModeCloud {
 		return a.runRemoteStatusWithConfig(ctx, cfg)
