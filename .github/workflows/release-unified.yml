@@ -28,7 +28,6 @@ jobs:
       checksum-filename: checksums.txt
       nfpm: auto
       stable-identifier: org.openclaw.gitcrawl
-      require-signed-tag: true
       darwin-universal: disabled
       ci-check-events: '["push","pull_request"]'
     secrets:
