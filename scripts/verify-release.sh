@@ -57,7 +57,7 @@ for goarch in "${architectures[@]}"; do
   }
 
   expected_listing=$'CHANGELOG.md\nLICENSE\nREADME.md\ngitcrawl'
-  actual_listing=$(tar -tzf "$archive" | LC_ALL=C sort)
+  actual_listing=$(tar -tzf "$archive" | sed -E 's#^\./##' | sed '/^$/d' | LC_ALL=C sort)
   [[ "$actual_listing" == "$expected_listing" ]] || {
     echo "unexpected archive contents: $archive" >&2
     exit 1
