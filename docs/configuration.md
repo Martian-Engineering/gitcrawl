@@ -57,7 +57,9 @@ to any command.
   `init --db` behavior remains database-only. Relative `--db`, `--runtime-dir`,
   and `--store-dir` filesystem paths are anchored to the current working
   directory before they are saved, so later commands keep using the same files.
-  `--db` accepts durable filesystem paths, not SQLite `file:` URIs or `:memory:`.
+  All database-path sources, including `--db`, `db_path`, and
+  `GITCRAWL_DB_PATH`, accept durable filesystem paths, not SQLite `file:` URIs
+  or `:memory:`.
 - Absolute XDG environment variables are honored even on macOS. Relative XDG
   values are ignored and gitcrawl falls back to the platform default for that
   path.
@@ -130,7 +132,7 @@ before updating gitcrawl.
 | Variable | Purpose |
 | --- | --- |
 | `GITCRAWL_CONFIG` | Override config path |
-| `GITCRAWL_DB_PATH` | Override database path |
+| `GITCRAWL_DB_PATH` | Override the database with a durable filesystem path; SQLite `file:` URIs and `:memory:` are unsupported |
 | `GITCRAWL_TUI_LAYOUT` | Override default TUI layout (`columns`, `right-stack`, or `focus`) |
 | `GITHUB_TOKEN` | GitHub API token (required for `sync`) |
 | `OPENAI_API_KEY` | OpenAI API key (required for `summarize` and `embed`) |

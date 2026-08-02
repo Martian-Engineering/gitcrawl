@@ -218,7 +218,9 @@ func TestApplyRuntimeEnvUsesDBEnv(t *testing.T) {
 	if err := cfg.Normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	cfg.ApplyRuntimeEnv()
+	if err := cfg.ApplyRuntimeEnv(); err != nil {
+		t.Fatalf("apply runtime env: %v", err)
+	}
 	if cfg.DBPath != dbPath {
 		t.Fatalf("db path: got %q want %q", cfg.DBPath, dbPath)
 	}
@@ -231,6 +233,54 @@ func TestApplyRuntimeEnvUsesDBEnv(t *testing.T) {
 	}
 	if cfg.VectorBackend != "turbovec" {
 		t.Fatalf("vector backend: got %q want turbovec", cfg.VectorBackend)
+	}
+}
+
+func TestNormalizeRejectsSQLiteDatabaseURIs(t *testing.T) {
+	for _, dbPath := range []string{":memory:", "file:archive.db", "file:/tmp/archive.db?mode=rwc"} {
+		t.Run(dbPath, func(t *testing.T) {
+			cfg := Default()
+			cfg.DBPath = dbPath
+			if err := cfg.Normalize(); err == nil || !strings.Contains(err.Error(), "db_path requires a filesystem path") {
+				t.Fatalf("normalize error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRuntimeRejectsSQLiteURIConfigPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(`db_path = "file:archive.db?_query_only=1"`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := LoadRuntime(path); err == nil || !strings.Contains(err.Error(), "db_path requires a filesystem path") {
+		t.Fatalf("load runtime error = %v", err)
+	}
+}
+
+func TestLoadRuntimeRejectsSQLiteURIEnvironmentPath(t *testing.T) {
+	for _, dbPath := range []string{":memory:", "file:archive.db?_query_only=1"} {
+		t.Run(dbPath, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			t.Setenv("GITCRAWL_DB_PATH", dbPath)
+			if _, err := LoadRuntime(path); err == nil || !strings.Contains(err.Error(), "db_path requires a filesystem path") {
+				t.Fatalf("load runtime error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadRuntimeRejectsSQLiteURIConfigEnvironmentPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[env]\nGITCRAWL_DB_PATH = ':memory:'\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("GITCRAWL_DB_PATH", "")
+	if _, err := LoadRuntime(path); err == nil || !strings.Contains(err.Error(), "db_path requires a filesystem path") {
+		t.Fatalf("load runtime error = %v", err)
 	}
 }
 
@@ -363,7 +413,9 @@ func TestApplyRuntimeEnvUsesConfigEnvFallback(t *testing.T) {
 	if err := cfg.Normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	cfg.ApplyRuntimeEnv()
+	if err := cfg.ApplyRuntimeEnv(); err != nil {
+		t.Fatalf("apply runtime env: %v", err)
+	}
 	if cfg.DBPath != dbPath {
 		t.Fatalf("db path: got %q want %q", cfg.DBPath, dbPath)
 	}
@@ -423,7 +475,9 @@ func TestApplyRuntimeEnvKeepsExplicitVectorDir(t *testing.T) {
 	if err := cfg.Normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	cfg.ApplyRuntimeEnv()
+	if err := cfg.ApplyRuntimeEnv(); err != nil {
+		t.Fatalf("apply runtime env: %v", err)
+	}
 	if cfg.VectorDir != vectorDir {
 		t.Fatalf("vector dir: got %q want explicit %q", cfg.VectorDir, vectorDir)
 	}

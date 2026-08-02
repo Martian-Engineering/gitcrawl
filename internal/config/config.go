@@ -126,7 +126,9 @@ func LoadRuntime(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.ApplyRuntimeEnv()
+	if err := cfg.ApplyRuntimeEnv(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -207,6 +209,9 @@ func (c *Config) Normalize() error {
 	}
 	c.Remote.Normalize()
 	c.DBPath = expandHome(c.DBPath)
+	if err := validateDatabasePath(c.DBPath); err != nil {
+		return err
+	}
 	c.CacheDir = expandHome(c.CacheDir)
 	if vectorDirWasDefault {
 		c.VectorDir = defaultVectorDirForDB(c.DBPath)
@@ -217,7 +222,7 @@ func (c *Config) Normalize() error {
 	return nil
 }
 
-func (c *Config) ApplyRuntimeEnv() {
+func (c *Config) ApplyRuntimeEnv() error {
 	c.OpenAI.SummaryModel = c.envOrDefault("GITCRAWL_SUMMARY_MODEL", c.OpenAI.SummaryModel)
 	c.OpenAI.EmbedModel = c.envOrDefault("GITCRAWL_EMBED_MODEL", c.OpenAI.EmbedModel)
 	c.OpenAI.EmbedBaseURL = c.envOrDefault("GITCRAWL_EMBED_BASE_URL", c.OpenAI.EmbedBaseURL)
@@ -237,6 +242,14 @@ func (c *Config) ApplyRuntimeEnv() {
 	if c.VectorBackend == "" {
 		c.VectorBackend = "exact"
 	}
+	return validateDatabasePath(c.DBPath)
+}
+
+func validateDatabasePath(path string) error {
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return fmt.Errorf("db_path requires a filesystem path; SQLite file: URIs and :memory: are unsupported")
+	}
+	return nil
 }
 
 func ResolveGitHubToken(cfg Config) TokenResolution {
