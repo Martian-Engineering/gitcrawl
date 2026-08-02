@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.8 - Unreleased
+## 0.8.8 - 2026-08-01
 
 ### Maintenance
 
