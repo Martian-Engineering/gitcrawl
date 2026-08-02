@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Maintenance
+
+- Update `actions/stale` to v11 and expose its debug-only mode for safe manual policy validation.
+- Accept the shared release workflow's leading `./` archive-member notation in local release verification.
+
 ## 0.8.8 - 2026-08-01
 
 ### Maintenance

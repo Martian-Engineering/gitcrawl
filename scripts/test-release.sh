@@ -138,7 +138,7 @@ for arch in amd64 arm64; do
   cp "$test_binary" "$stage/gitcrawl"
   cp "$ROOT/CHANGELOG.md" "$ROOT/LICENSE" "$ROOT/README.md" "$stage/"
   archive="gitcrawl_0.7.1_darwin_${arch}.tar.gz"
-  tar -czf "$ARTIFACTS/$archive" -C "$stage" CHANGELOG.md LICENSE README.md gitcrawl
+  tar -czf "$ARTIFACTS/$archive" -C "$stage" .
   shasum -a 256 "$ARTIFACTS/$archive" | awk -v name="$archive" '{ print $1 "  " name }' >> "$ARTIFACTS/checksums.txt"
 done
 
