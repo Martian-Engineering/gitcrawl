@@ -5,6 +5,8 @@
 ### Maintenance
 
 - Move official releases to the shared signed, notarized, independently verified GitHub Actions pipeline while preserving archive names, contents, checksums, and Homebrew delivery.
+- Reject SQLite `file:` URIs and `:memory:` consistently for configured and environment-supplied database paths, preserving Gitcrawl's filesystem-only archive contract across driver upgrades.
+- Update CrawlKit to v0.14.4, SQLite to v1.55.0, the matching modernc libc runtime to v1.74.4, TruffleHog to v3.96.0, and the current golden-test, profiling, experimental, and modernc compiler helpers.
 
 ## 0.8.7 - 2026-07-26
 
