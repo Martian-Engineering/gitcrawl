@@ -2,17 +2,81 @@ package cli
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/openclaw/gitcrawl/internal/config"
 )
+
+func writeTestCompressedPortableSource(t *testing.T, dbPath string) string {
+	t.Helper()
+	manifestPath := writeTestPortableManifest(t, dbPath)
+	manifest, ok, err := readPortableDBManifest(manifestPath)
+	if err != nil || !ok {
+		t.Fatalf("read direct portable manifest: ok=%v err=%v", ok, err)
+	}
+	archivePath := dbPath + ".gz"
+	source, err := os.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open portable db: %v", err)
+	}
+	archive, err := os.Create(archivePath)
+	if err != nil {
+		_ = source.Close()
+		t.Fatalf("create portable archive: %v", err)
+	}
+	writer := gzip.NewWriter(archive)
+	if _, err := io.Copy(writer, source); err != nil {
+		_ = writer.Close()
+		_ = archive.Close()
+		_ = source.Close()
+		t.Fatalf("compress portable db: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		_ = archive.Close()
+		_ = source.Close()
+		t.Fatalf("close portable gzip writer: %v", err)
+	}
+	if err := archive.Close(); err != nil {
+		_ = source.Close()
+		t.Fatalf("close portable archive: %v", err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("close portable db: %v", err)
+	}
+	archiveInfo, err := os.Stat(archivePath)
+	if err != nil {
+		t.Fatalf("stat portable archive: %v", err)
+	}
+	archiveSum, err := fileSHA256(archivePath)
+	if err != nil {
+		t.Fatalf("hash portable archive: %v", err)
+	}
+	manifest.Compression = "gzip"
+	manifest.ArchivePath = filepath.Base(archivePath)
+	manifest.ArchiveBytes = archiveInfo.Size()
+	manifest.ArchiveSHA256 = fmt.Sprintf("%x", archiveSum)
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal compressed portable manifest: %v", err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0o644); err != nil {
+		t.Fatalf("write compressed portable manifest: %v", err)
+	}
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatalf("remove direct portable db: %v", err)
+	}
+	return archivePath
+}
 
 func TestLocalRuntimeDBTarget(t *testing.T) {
 	direct := localRuntime{Config: config.Config{DBPath: "/data/gitcrawl.db"}}
@@ -115,6 +179,109 @@ func TestCopySQLiteFileAtomicVerifiedRemovesTempFiles(t *testing.T) {
 		if _, err := os.Stat(tempPath + suffix); !os.IsNotExist(err) {
 			t.Fatalf("temp sidecar %s still exists: %v", suffix, err)
 		}
+	}
+}
+
+func TestRefreshPortableRuntimeDBInflatesCompressedSource(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	checkoutDir := filepath.Join(dir, "checkout")
+	sourceDB := filepath.Join(checkoutDir, "data", "openclaw__openclaw.sync.db")
+	mirrorDB := filepath.Join(dir, "runtime", "openclaw__openclaw.sync.db")
+	seedPortableThread(t, sourceDB, 7, "compressed portable source")
+	writeTestCompressedPortableSource(t, sourceDB)
+
+	changed, err := refreshPortableRuntimeDB(
+		ctx,
+		sourceDB,
+		mirrorDB,
+		false,
+		filepath.Join(dir, "config.toml"),
+	)
+	if err != nil || !changed {
+		t.Fatalf("refresh compressed portable source: changed=%v err=%v", changed, err)
+	}
+	if err := sqliteStoreHealth(ctx, mirrorDB); err != nil {
+		t.Fatalf("inflated mirror health: %v", err)
+	}
+	manifest, ok, err := readPortableDBManifest(portableDBManifestPath(sourceDB))
+	if err != nil || !ok {
+		t.Fatalf("read compressed manifest: ok=%v err=%v", ok, err)
+	}
+	sum, err := fileSHA256(mirrorDB)
+	if err != nil {
+		t.Fatalf("hash inflated mirror: %v", err)
+	}
+	if got := fmt.Sprintf("%x", sum); got != manifest.SHA256 {
+		t.Fatalf("inflated mirror sha256 = %s, want %s", got, manifest.SHA256)
+	}
+}
+
+func TestCompressedPortableSourceFailureKeepsLastGoodMirror(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	checkoutDir := filepath.Join(dir, "checkout")
+	sourceDB := filepath.Join(checkoutDir, "data", "openclaw__openclaw.sync.db")
+	mirrorDB := filepath.Join(dir, "runtime", "openclaw__openclaw.sync.db")
+	seedPortableThread(t, sourceDB, 8, "new compressed content")
+	archivePath := writeTestCompressedPortableSource(t, sourceDB)
+	seedPortableThread(t, mirrorDB, 9, "last good mirror")
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(mirrorDB, past, past); err != nil {
+		t.Fatalf("age mirror: %v", err)
+	}
+	before, err := fileSHA256(mirrorDB)
+	if err != nil {
+		t.Fatalf("hash mirror before: %v", err)
+	}
+	if err := os.WriteFile(archivePath, []byte("truncated"), 0o644); err != nil {
+		t.Fatalf("corrupt portable archive: %v", err)
+	}
+
+	changed, err := refreshPortableRuntimeDB(
+		ctx,
+		sourceDB,
+		mirrorDB,
+		false,
+		filepath.Join(dir, "config.toml"),
+	)
+	if err == nil || changed || !strings.Contains(err.Error(), "portable manifest mismatch") {
+		t.Fatalf("corrupt compressed source: changed=%v err=%v", changed, err)
+	}
+	after, err := fileSHA256(mirrorDB)
+	if err != nil {
+		t.Fatalf("hash mirror after: %v", err)
+	}
+	if after != before {
+		t.Fatal("failed compressed refresh replaced the last good mirror")
+	}
+}
+
+func TestCompressedPortableManifestRejectsEscapingArchivePath(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	manifest := portableDBManifest{
+		Schema:        "gitcrawl-portable-sync-v2",
+		OutputBytes:   1,
+		SHA256:        strings.Repeat("a", 64),
+		Compression:   "gzip",
+		ArchivePath:   "../escape.db.gz",
+		ArchiveBytes:  1,
+		ArchiveSHA256: strings.Repeat("b", 64),
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if err := os.WriteFile(portableDBManifestPath(dbPath), data, 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if _, _, _, err := portableSourceArtifact(dbPath); err == nil ||
+		!strings.Contains(err.Error(), "archivePath escapes") {
+		t.Fatalf("escaping archivePath error = %v", err)
 	}
 }
 

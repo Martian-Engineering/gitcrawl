@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Portable stores
+
+- Load manifest-backed gzip SQLite artifacts into the verified runtime mirror, preserving the uncompressed size, digest, and `quick_check` contract when a portable database outgrows GitHub's single-file limit.
+
 ### Maintenance
 
 - Rewrite the README around the local-first quickstart and move deeper cloud archive and Docker material into the documentation.

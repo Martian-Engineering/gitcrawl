@@ -46,6 +46,15 @@ fixed checkout path.
 
 JSON output reports `portable_store_url`, `portable_store_dir`, and `portable_store: cloned|pulled|reset-pulled` so automation can tell what happened.
 
+Large stores may commit a gzip artifact instead of the raw SQLite file. The
+configured `db_path` remains the logical SQLite path, while its sibling
+manifest declares `compression: "gzip"`, a relative `archivePath`, and the
+archive size and SHA-256. Gitcrawl verifies the compressed artifact, inflates
+at most the manifest's declared SQLite size, verifies the existing uncompressed
+size and SHA-256, runs SQLite `quick_check`, and only then atomically replaces
+the runtime mirror. Legacy raw SQLite stores continue to use the same manifest
+without compression fields.
+
 ## How read-only commands behave
 
 Read-only commands (`search`, `threads`, `clusters`, `cluster-detail`, `neighbors`, the TUI) refresh the portable-store checkout before reading, so they always see the latest published data:
@@ -55,6 +64,7 @@ Read-only commands (`search`, `threads`, `clusters`, `cluster-detail`, `neighbor
 - Stale SQLite sidecars (WAL, SHM) are cleared after the pull so queries see freshly pulled data
 - Local Git pull configuration that tries to rebase onto multiple branch merge refs is handled cleanly
 - SQLite files are copied through a temporary runtime database, checked with `quick_check`, and verified against the portable manifest before replacing the previous runtime mirror
+- Manifest-backed gzip SQLite artifacts are verified before inflation and still use the uncompressed database digest as the runtime identity
 
 If the remote is unreachable, the read still answers from the local checkout.
 

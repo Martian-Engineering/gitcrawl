@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -696,12 +697,16 @@ func sqliteStoreHealthWithOpen(ctx context.Context, path string, open func(conte
 }
 
 type portableDBManifest struct {
-	Schema      string `json:"schema,omitempty"`
-	ExportedAt  string `json:"exportedAt,omitempty"`
-	OutputPath  string `json:"outputPath,omitempty"`
-	OutputBytes int64  `json:"outputBytes,omitempty"`
-	SHA256      string `json:"sha256,omitempty"`
-	QuickCheck  string `json:"quickCheck,omitempty"`
+	Schema        string `json:"schema,omitempty"`
+	ExportedAt    string `json:"exportedAt,omitempty"`
+	OutputPath    string `json:"outputPath,omitempty"`
+	OutputBytes   int64  `json:"outputBytes,omitempty"`
+	SHA256        string `json:"sha256,omitempty"`
+	QuickCheck    string `json:"quickCheck,omitempty"`
+	Compression   string `json:"compression,omitempty"`
+	ArchivePath   string `json:"archivePath,omitempty"`
+	ArchiveBytes  int64  `json:"archiveBytes,omitempty"`
+	ArchiveSHA256 string `json:"archiveSha256,omitempty"`
 }
 
 func portableDBManifestPath(dbPath string) string {
@@ -716,10 +721,33 @@ func validatePortableSQLiteFile(ctx context.Context, dbPath, manifestDBPath stri
 }
 
 func validatePortableSQLiteSourceFile(ctx context.Context, dbPath, manifestDBPath string) error {
-	if err := sqliteStoreImmutableHealth(ctx, dbPath); err != nil {
+	_, _, compressed, err := portableSourceArtifact(dbPath)
+	if err != nil {
 		return err
 	}
-	return validatePortableDBManifest(dbPath, portableDBManifestPath(manifestDBPath))
+	if !compressed {
+		if err := sqliteStoreImmutableHealth(ctx, dbPath); err != nil {
+			return err
+		}
+		return validatePortableDBManifest(dbPath, portableDBManifestPath(manifestDBPath))
+	}
+	tempDir, err := os.MkdirTemp("", "gitcrawl-portable-source-*")
+	if err != nil {
+		return fmt.Errorf("create portable source validation dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+	tempPath, err := stagePortableSQLiteSourceTemp(dbPath, filepath.Join(tempDir, filepath.Base(dbPath)), 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = os.Remove(tempPath)
+		removeSQLiteTempSidecars(tempPath)
+	}()
+	if err := sqliteStoreImmutableHealth(ctx, tempPath); err != nil {
+		return err
+	}
+	return validatePortableDBManifest(tempPath, portableDBManifestPath(manifestDBPath))
 }
 
 func validatePortableDBManifest(dbPath, manifestPath string) error {
@@ -775,6 +803,82 @@ func readPortableDBManifest(path string) (portableDBManifest, bool, error) {
 	return manifest, true, nil
 }
 
+func portableSourceArtifact(dbPath string) (string, portableDBManifest, bool, error) {
+	manifestPath := portableDBManifestPath(dbPath)
+	manifest, ok, err := readPortableDBManifest(manifestPath)
+	if err != nil {
+		return "", portableDBManifest{}, false, fmt.Errorf("portable manifest mismatch: %w", err)
+	}
+	if !ok || strings.TrimSpace(manifest.Compression) == "" {
+		return dbPath, manifest, false, nil
+	}
+	if strings.TrimSpace(manifest.Compression) != "gzip" {
+		return "", portableDBManifest{}, false, fmt.Errorf(
+			"portable manifest mismatch: unsupported compression %q",
+			manifest.Compression,
+		)
+	}
+	archiveRaw := strings.TrimSpace(manifest.ArchivePath)
+	if archiveRaw == "" ||
+		strings.HasPrefix(archiveRaw, "/") ||
+		strings.HasPrefix(archiveRaw, "\\") ||
+		(len(archiveRaw) >= 2 && archiveRaw[1] == ':') {
+		return "", portableDBManifest{}, false, fmt.Errorf("portable manifest mismatch: archivePath must be relative")
+	}
+	for _, component := range strings.FieldsFunc(archiveRaw, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if component == ".." {
+			return "", portableDBManifest{}, false, fmt.Errorf("portable manifest mismatch: archivePath escapes the store")
+		}
+	}
+	archivePath := filepath.FromSlash(archiveRaw)
+	archivePath = filepath.Clean(archivePath)
+	if archivePath == "." || archivePath == ".." || strings.HasPrefix(archivePath, ".."+string(os.PathSeparator)) {
+		return "", portableDBManifest{}, false, fmt.Errorf("portable manifest mismatch: archivePath escapes the store")
+	}
+	manifestDir := filepath.Dir(manifestPath)
+	resolved := filepath.Join(manifestDir, archivePath)
+	relative, err := filepath.Rel(manifestDir, resolved)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return "", portableDBManifest{}, false, fmt.Errorf("portable manifest mismatch: archivePath escapes the store")
+	}
+	if manifest.ArchiveBytes <= 0 {
+		return "", portableDBManifest{}, false, fmt.Errorf("portable manifest mismatch: archiveBytes missing")
+	}
+	if strings.TrimSpace(manifest.ArchiveSHA256) == "" {
+		return "", portableDBManifest{}, false, fmt.Errorf("portable manifest mismatch: archiveSha256 missing")
+	}
+	return resolved, manifest, true, nil
+}
+
+func validatePortableArchive(path string, manifest portableDBManifest) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Size() != manifest.ArchiveBytes {
+		return fmt.Errorf(
+			"portable manifest mismatch: archive size %d != %d",
+			info.Size(),
+			manifest.ArchiveBytes,
+		)
+	}
+	sum, err := fileSHA256(path)
+	if err != nil {
+		return err
+	}
+	sumText := fmt.Sprintf("%x", sum)
+	if !strings.EqualFold(sumText, strings.TrimSpace(manifest.ArchiveSHA256)) {
+		return fmt.Errorf(
+			"portable manifest mismatch: archive sha256 %s != %s",
+			sumText,
+			manifest.ArchiveSHA256,
+		)
+	}
+	return nil
+}
+
 func isPortableSourceRepairableHealthError(err error) bool {
 	return isSQLiteCorruption(err) || isPortableManifestMismatch(err)
 }
@@ -802,12 +906,16 @@ func preserveMalformedPortableDB(root, dbPath string) (string, error) {
 	if err := os.MkdirAll(backupDir, 0o755); err != nil {
 		return "", fmt.Errorf("create malformed db backup: %w", err)
 	}
-	for _, path := range []string{
+	paths := []string{
 		dbPath,
 		dbPath + "-wal",
 		dbPath + "-shm",
 		dbPath + ".manifest.json",
-	} {
+	}
+	if archivePath, _, compressed, err := portableSourceArtifact(dbPath); err == nil && compressed {
+		paths = append(paths, archivePath)
+	}
+	for _, path := range paths {
 		if _, err := os.Stat(path); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -837,7 +945,11 @@ func recentPortableRefresh(value string, now time.Time, maxAge time.Duration) bo
 }
 
 func portableRuntimeNeedsCopy(sourceDBPath, mirrorPath string) (bool, error) {
-	sourceInfo, err := os.Stat(sourceDBPath)
+	sourcePath, _, _, err := portableSourceArtifact(sourceDBPath)
+	if err != nil {
+		return false, err
+	}
+	sourceInfo, err := os.Stat(sourcePath)
 	if err != nil {
 		return false, fmt.Errorf("stat portable source db: %w", err)
 	}
@@ -903,7 +1015,7 @@ func stageFileCopyTemp(sourcePath, targetPath string, mode os.FileMode) (string,
 }
 
 func copySQLiteFileAtomicVerified(ctx context.Context, sourcePath, targetPath string) error {
-	tempPath, err := stageFileCopyTemp(sourcePath, targetPath, 0o600)
+	tempPath, err := stagePortableSQLiteSourceTemp(sourcePath, targetPath, 0o600)
 	if err != nil {
 		return err
 	}
@@ -924,6 +1036,66 @@ func copySQLiteFileAtomicVerified(ctx context.Context, sourcePath, targetPath st
 	removeSQLiteTempSidecars(tempPath)
 	removeSQLiteTempSidecars(targetPath)
 	return nil
+}
+
+func stagePortableSQLiteSourceTemp(sourceDBPath, targetPath string, mode os.FileMode) (string, error) {
+	sourcePath, manifest, compressed, err := portableSourceArtifact(sourceDBPath)
+	if err != nil {
+		return "", err
+	}
+	if !compressed {
+		return stageFileCopyTemp(sourcePath, targetPath, mode)
+	}
+	if err := validatePortableArchive(sourcePath, manifest); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return "", fmt.Errorf("create portable runtime dir: %w", err)
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return "", fmt.Errorf("open portable source archive: %w", err)
+	}
+	defer source.Close()
+	reader, err := gzip.NewReader(source)
+	if err != nil {
+		return "", fmt.Errorf("open portable gzip archive: %w", err)
+	}
+	defer reader.Close()
+	temp, err := os.CreateTemp(filepath.Dir(targetPath), "."+filepath.Base(targetPath)+".tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("create portable runtime temp db: %w", err)
+	}
+	tempPath := temp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempPath)
+			removeSQLiteTempSidecars(tempPath)
+		}
+	}()
+	written, copyErr := io.Copy(temp, io.LimitReader(reader, manifest.OutputBytes+1))
+	if copyErr != nil {
+		_ = temp.Close()
+		return "", fmt.Errorf("inflate portable runtime db: %w", copyErr)
+	}
+	if written != manifest.OutputBytes {
+		_ = temp.Close()
+		return "", fmt.Errorf(
+			"portable manifest mismatch: inflated size %d != %d",
+			written,
+			manifest.OutputBytes,
+		)
+	}
+	if err := temp.Chmod(mode); err != nil {
+		_ = temp.Close()
+		return "", fmt.Errorf("chmod portable runtime db: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return "", fmt.Errorf("close portable runtime db: %w", err)
+	}
+	cleanup = false
+	return tempPath, nil
 }
 
 // publishPortableCheckoutPair replaces the checkout database and manifest with
