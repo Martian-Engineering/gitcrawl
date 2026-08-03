@@ -285,6 +285,198 @@ func TestCompressedPortableManifestRejectsEscapingArchivePath(t *testing.T) {
 	}
 }
 
+func TestCompressedPortableManifestRejectsInvalidMetadata(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	manifestPath := portableDBManifestPath(dbPath)
+	base := portableDBManifest{
+		Schema:        "gitcrawl-portable-sync-v2",
+		OutputBytes:   1,
+		SHA256:        strings.Repeat("a", 64),
+		Compression:   "gzip",
+		ArchivePath:   filepath.Base(dbPath) + ".gz",
+		ArchiveBytes:  1,
+		ArchiveSHA256: strings.Repeat("b", 64),
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*portableDBManifest)
+		message string
+	}{
+		{
+			name:    "unsupported compression",
+			mutate:  func(manifest *portableDBManifest) { manifest.Compression = "zstd" },
+			message: "unsupported compression",
+		},
+		{
+			name:    "missing archive path",
+			mutate:  func(manifest *portableDBManifest) { manifest.ArchivePath = "" },
+			message: "archivePath must be relative",
+		},
+		{
+			name:    "absolute archive path",
+			mutate:  func(manifest *portableDBManifest) { manifest.ArchivePath = "/tmp/store.db.gz" },
+			message: "archivePath must be relative",
+		},
+		{
+			name:    "drive letter archive path",
+			mutate:  func(manifest *portableDBManifest) { manifest.ArchivePath = `C:\store.db.gz` },
+			message: "archivePath must be relative",
+		},
+		{
+			name:    "current directory archive path",
+			mutate:  func(manifest *portableDBManifest) { manifest.ArchivePath = "." },
+			message: "archivePath escapes the store",
+		},
+		{
+			name:    "missing archive bytes",
+			mutate:  func(manifest *portableDBManifest) { manifest.ArchiveBytes = 0 },
+			message: "archiveBytes missing",
+		},
+		{
+			name:    "missing archive sha",
+			mutate:  func(manifest *portableDBManifest) { manifest.ArchiveSHA256 = "" },
+			message: "archiveSha256 missing",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := base
+			tc.mutate(&manifest)
+			data, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatalf("marshal manifest: %v", err)
+			}
+			if err := os.WriteFile(manifestPath, data, 0o644); err != nil {
+				t.Fatalf("write manifest: %v", err)
+			}
+			if _, _, _, err := portableSourceArtifact(dbPath); err == nil ||
+				!strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("portable source error = %v, want %q", err, tc.message)
+			}
+		})
+	}
+}
+
+func TestCompressedPortableArchiveRejectsTampering(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "data", "openclaw__openclaw.sync.db")
+	seedPortableThread(t, dbPath, 10, "compressed portable source")
+	archivePath := writeTestCompressedPortableSource(t, dbPath)
+	manifestPath := portableDBManifestPath(dbPath)
+	manifest, ok, err := readPortableDBManifest(manifestPath)
+	if err != nil || !ok {
+		t.Fatalf("read compressed manifest: ok=%v err=%v", ok, err)
+	}
+
+	manifest.ArchiveBytes++
+	if err := validatePortableArchive(archivePath, manifest); err == nil ||
+		!strings.Contains(err.Error(), "archive size") {
+		t.Fatalf("archive size error = %v", err)
+	}
+
+	manifest.ArchiveBytes--
+	manifest.ArchiveSHA256 = strings.Repeat("0", 64)
+	if err := validatePortableArchive(archivePath, manifest); err == nil ||
+		!strings.Contains(err.Error(), "archive sha256") {
+		t.Fatalf("archive hash error = %v", err)
+	}
+}
+
+func TestCompressedPortableArchiveRejectsInvalidPayload(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "data", "openclaw__openclaw.sync.db")
+	seedPortableThread(t, dbPath, 11, "compressed portable source")
+	archivePath := writeTestCompressedPortableSource(t, dbPath)
+	manifestPath := portableDBManifestPath(dbPath)
+	targetPath := filepath.Join(dir, "runtime", filepath.Base(dbPath))
+
+	writeArchive := func(data []byte, outputBytes int64) {
+		t.Helper()
+		if err := os.WriteFile(archivePath, data, 0o644); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+		manifest, ok, err := readPortableDBManifest(manifestPath)
+		if err != nil || !ok {
+			t.Fatalf("read compressed manifest: ok=%v err=%v", ok, err)
+		}
+		info, err := os.Stat(archivePath)
+		if err != nil {
+			t.Fatalf("stat archive: %v", err)
+		}
+		sum, err := fileSHA256(archivePath)
+		if err != nil {
+			t.Fatalf("hash archive: %v", err)
+		}
+		manifest.OutputBytes = outputBytes
+		manifest.ArchiveBytes = info.Size()
+		manifest.ArchiveSHA256 = fmt.Sprintf("%x", sum)
+		encoded, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatalf("marshal compressed manifest: %v", err)
+		}
+		if err := os.WriteFile(manifestPath, encoded, 0o644); err != nil {
+			t.Fatalf("write compressed manifest: %v", err)
+		}
+	}
+
+	writeArchive([]byte("not gzip"), 1)
+	if _, err := stagePortableSQLiteSourceTemp(dbPath, targetPath, 0o600); err == nil ||
+		!strings.Contains(err.Error(), "open portable gzip archive") {
+		t.Fatalf("invalid gzip error = %v", err)
+	}
+
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write([]byte("short")); err != nil {
+		t.Fatalf("write gzip payload: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close gzip payload: %v", err)
+	}
+	writeArchive(compressed.Bytes(), 10)
+	if _, err := stagePortableSQLiteSourceTemp(dbPath, targetPath, 0o600); err == nil ||
+		!strings.Contains(err.Error(), "inflated size") {
+		t.Fatalf("inflated size error = %v", err)
+	}
+}
+
+func TestValidateCompressedPortableSQLiteSource(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "data", "openclaw__openclaw.sync.db")
+	seedPortableThread(t, dbPath, 12, "compressed validation source")
+	writeTestCompressedPortableSource(t, dbPath)
+
+	if err := validatePortableSQLiteSourceFile(ctx, dbPath, dbPath); err != nil {
+		t.Fatalf("validate compressed portable source: %v", err)
+	}
+}
+
+func TestPreserveMalformedCompressedPortableSource(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "checkout")
+	dbPath := filepath.Join(root, "data", "openclaw__openclaw.sync.db")
+	seedPortableThread(t, dbPath, 13, "compressed evidence source")
+	archivePath := writeTestCompressedPortableSource(t, dbPath)
+
+	backupDir, err := preserveMalformedPortableDB(root, dbPath)
+	if err != nil {
+		t.Fatalf("preserve compressed portable source: %v", err)
+	}
+	for _, name := range []string{
+		filepath.Base(archivePath) + ".malformed",
+		filepath.Base(portableDBManifestPath(dbPath)),
+	} {
+		if _, err := os.Stat(filepath.Join(backupDir, name)); err != nil {
+			t.Fatalf("stat preserved evidence %s: %v", name, err)
+		}
+	}
+}
+
 func writeTestPortableManifest(t *testing.T, dbPath string) string {
 	t.Helper()
 	info, err := os.Stat(dbPath)
