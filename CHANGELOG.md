@@ -11,6 +11,7 @@
 - Rewrite the README around the local-first quickstart and move deeper cloud archive and Docker material into the documentation.
 - Update `actions/stale` to v11 and expose its debug-only mode for safe manual policy validation.
 - Accept the shared release workflow's leading `./` archive-member notation in local release verification.
+- Update CrawlKit to v0.14.6, SQLite to v1.56.0, the current modernc libc and memory releases, and the golden-test helper.
 
 ## 0.8.8 - 2026-08-01
 
