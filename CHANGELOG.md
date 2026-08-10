@@ -1,10 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.9.1 - 2026-08-10
+
+**Highlight:** `portable export` now produces stable artifact identities — local
+ingestion churn no longer changes the output digest, so unchanged data stops
+producing spuriously different exports.
 
 ### Portable stores
 
-- Add streamlined `portable export` generations with single-pass sanitized compatibility tables, compact final files, and semantic artifact identity that ignores explicit local ingestion churn while retaining exact SQLite SHA-256 integrity, granular progress, and clean interruption.
+- Add streamlined `portable export` generations with single-pass sanitized compatibility tables and compact final files. Artifact identity now ignores explicit local ingestion churn while retaining exact SQLite SHA-256 integrity, so re-exporting unchanged data yields the same identity. Includes granular progress reporting and clean interruption handling.
+- Preserve the full schema in current-state exports, so a restored database matches the source structure rather than only its rows.
+
+### Dependencies and maintenance
+
+- Update Kong to v1.16.1.
 
 ## 0.9.0 - 2026-08-08
 
