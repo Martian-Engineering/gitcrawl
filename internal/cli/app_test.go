@@ -4799,6 +4799,159 @@ func TestPortablePruneCommand(t *testing.T) {
 	}
 }
 
+func TestPortableExportCommandCreatesCurrentStateGenerationFromLiveWAL(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "source.db")
+	if err := New().Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	seedPortableThread(t, dbPath, 7, "live WAL title")
+	writer, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer writer.Close()
+	writer.DB().SetMaxOpenConns(1)
+	if _, err := writer.DB().ExecContext(ctx, `pragma wal_autocheckpoint = 0`); err != nil {
+		t.Fatalf("disable WAL autocheckpoint: %v", err)
+	}
+	if _, err := writer.DB().ExecContext(ctx, `update threads set title = 'committed WAL title' where number = 7`); err != nil {
+		t.Fatalf("write live WAL state: %v", err)
+	}
+
+	outputDir := filepath.Join(dir, "artifact.next")
+	app := New()
+	var stdout, stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+	if err := app.Run(ctx, []string{
+		"--config", configPath,
+		"portable", "export",
+		"--profile", "current-state-v1",
+		"--body-chars", "32",
+		"--output-dir", outputDir,
+		"--database-name", "openclaw__openclaw.sync.db",
+		"--public-path", "data/openclaw__openclaw.sync.db",
+		"--repository", "openclaw/openclaw",
+		"--max-bytes", "99999999",
+		"--json",
+	}); err != nil {
+		t.Fatalf("portable export: %v", err)
+	}
+	var payload struct {
+		Profile        string `json:"profile"`
+		PortableSchema string `json:"portable_schema"`
+		SourceDBPath   string `json:"source_db_path"`
+		OutputDir      string `json:"output_dir"`
+		DatabasePath   string `json:"database_path"`
+		ManifestPath   string `json:"manifest_path"`
+		PublicPath     string `json:"public_path"`
+		Repository     struct {
+			ID       int64  `json:"id"`
+			Owner    string `json:"owner"`
+			Name     string `json:"name"`
+			FullName string `json:"fullName"`
+		} `json:"repository"`
+		BodyChars            int    `json:"body_chars"`
+		BytesAfter           int64  `json:"bytes_after"`
+		MaxBytes             int64  `json:"max_bytes"`
+		ArtifactID           string `json:"artifact_id"`
+		SHA256               string `json:"sha256"`
+		QuickCheck           string `json:"quick_check"`
+		IntegrityCheck       string `json:"integrity_check"`
+		ForeignKeyViolations int    `json:"foreign_key_violations"`
+		ArtifactCommitted    bool   `json:"artifact_committed"`
+		ColumnProfile        string `json:"column_profile"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("parse portable export JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.Profile != "current-state-v1" || payload.PortableSchema != "gitcrawl-portable-sync-v2" ||
+		payload.SourceDBPath != dbPath || payload.OutputDir != outputDir || payload.PublicPath != "data/openclaw__openclaw.sync.db" ||
+		payload.Repository.Owner != "openclaw" || payload.Repository.Name != "openclaw" || payload.Repository.FullName != "openclaw/openclaw" ||
+		payload.BodyChars != 32 || payload.MaxBytes != 99999999 || payload.BytesAfter <= 0 || payload.ArtifactID != payload.SHA256 ||
+		payload.QuickCheck != "ok" || payload.IntegrityCheck != "ok" || payload.ForeignKeyViolations != 0 || !payload.ArtifactCommitted ||
+		payload.ColumnProfile != store.PortableColumnProfileSanitizedCompatibility {
+		t.Fatalf("portable export payload = %+v", payload)
+	}
+	artifact, err := sql.Open("sqlite", payload.DatabasePath)
+	if err != nil {
+		t.Fatalf("open artifact: %v", err)
+	}
+	defer artifact.Close()
+	var title, sourcePath string
+	if err := artifact.QueryRowContext(ctx, `select title from threads where number = 7`).Scan(&title); err != nil {
+		t.Fatalf("read exported thread: %v", err)
+	}
+	if err := artifact.QueryRowContext(ctx, `select value from portable_metadata where key = 'source_path'`).Scan(&sourcePath); err != nil {
+		t.Fatalf("read portable source path: %v", err)
+	}
+	if title != "committed WAL title" || sourcePath != payload.PublicPath || strings.Contains(sourcePath, dir) {
+		t.Fatalf("artifact title/source = %q / %q", title, sourcePath)
+	}
+	if _, err := os.Stat(payload.ManifestPath); err != nil {
+		t.Fatalf("manifest missing: %v", err)
+	}
+	for _, stage := range []string{
+		"snapshot", "repository scope", "profile omissions", "canonical shaping",
+		"canonical shaping: thread bodies",
+		"canonical shaping: comment and review bodies",
+		"canonical shaping: metadata and raw payload cleanup",
+		"canonical shaping: fingerprints and summaries",
+		"canonical shaping: discarded tables and failure ledger",
+		"canonical shaping: canonical schema finalization",
+		"canonical shaping: canonical schema finalization: disposable table drop",
+		"canonical shaping: threads rebuild: preflight",
+		"canonical shaping: threads rebuild: foreign key proof",
+		"canonical shaping: threads rebuild: compact copy",
+		"canonical shaping: threads rebuild: schema swap",
+		"canonical shaping: threads rebuild: schema restore",
+		"index removal", "final vacuum", "validation", "manifest", "artifact commit", "complete",
+	} {
+		prefix := "gitcrawl: portable export: stage=" + stage + " "
+		var progressLine string
+		for _, line := range strings.Split(stderr.String(), "\n") {
+			if strings.HasPrefix(line, prefix) {
+				progressLine = line
+				break
+			}
+		}
+		if progressLine == "" || !strings.Contains(progressLine, "after=") || !strings.Contains(progressLine, "total=") {
+			t.Fatalf("timed progress missing for %q:\n%s", stage, stderr.String())
+		}
+		if strings.Contains(stdout.String(), prefix) {
+			t.Fatalf("progress leaked to JSON stdout: %s", stdout.String())
+		}
+	}
+}
+
+func TestPortableExportCommandValidatesProfileBeforeOpeningSource(t *testing.T) {
+	app := New()
+	err := app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "future-v2", "--output-dir", filepath.Join(t.TempDir(), "out"),
+	})
+	if err == nil || !strings.Contains(err.Error(), `unsupported portable export profile "future-v2"`) {
+		t.Fatalf("unknown profile error = %v", err)
+	}
+	err = app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "current-state-v1", "--output-dir", filepath.Join(t.TempDir(), "out"), "--repository", "openclaw",
+	})
+	if err == nil || !strings.Contains(err.Error(), `repository: expected owner/repo, got "openclaw"`) {
+		t.Fatalf("invalid repository error = %v", err)
+	}
+	err = app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "current-state-v1", "--output-dir", filepath.Join(t.TempDir(), "out"), "--repository", "openclaw /gitcrawl",
+	})
+	if err == nil || !strings.Contains(err.Error(), `repository: expected owner/repo, got "openclaw /gitcrawl"`) {
+		t.Fatalf("non-canonical repository error = %v", err)
+	}
+}
+
 type portablePruneTestFixture struct {
 	configPath string
 	checkoutDB string

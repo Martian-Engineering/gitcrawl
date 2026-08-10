@@ -104,7 +104,7 @@ Portable v2 keeps the data agents most often need for offline GitHub reads:
 - PR details, files, commits, status checks, and workflow runs
 - Thread revisions, deterministic fingerprints, and key summaries used by duplicate and cluster-oriented workflows
 
-It strips the data that is large, private, easy to regenerate, or mainly useful for exact API replay: raw GitHub JSON, generated documents and FTS indexes, embeddings and vectors, code snapshots and diff blobs, cluster run history, the sync failure ledger, similarity edges, and blob storage. Pass `--include-sync-failures` only when failure history is useful to portable-store readers; the table is retained but every `error_message` is replaced with `[redacted for portable export]`. Once the source schema contains the ledger, pruning securely rewrites the database even with `--no-vacuum` so current, deleted, and historical retry text cannot remain in free pages. An interrupted rewrite remains marked pending and is retried by the next prune. The database records this contract in `portable_metadata` with `schema=gitcrawl-portable-sync-v2`, `includes`, `excluded`, `capabilities`, and `thread_author_profile` keys. The added revision, fingerprint, summary, and author-association fields are additive; the portable schema identifier remains v2 so older readers can continue using the columns and tables they understand.
+It strips the data that is large, private, easy to regenerate, or mainly useful for exact API replay: raw GitHub JSON, generated documents and FTS indexes, embeddings and vectors, code snapshots and diff blobs (including `pull_request_files.patch`), cluster run history, the sync failure ledger, similarity edges, and blob storage. PR file path, status, line counts, rename metadata, and other current file identity remain. Pass `--include-sync-failures` only when failure history is useful to portable-store readers; the table is retained but every `error_message` is replaced with `[redacted for portable export]`. Once the source schema contains the ledger, pruning securely rewrites the database even with `--no-vacuum` so current, deleted, and historical retry text cannot remain in free pages. An interrupted rewrite remains marked pending and is retried by the next prune. The database records this contract in `portable_metadata` with `schema=gitcrawl-portable-sync-v2`, `includes`, `excluded`, `capabilities`, and `thread_author_profile` keys. The added revision, fingerprint, summary, and author-association fields are additive; the portable schema identifier remains v2 so older readers can continue using the columns and tables they understand.
 
 Portable mirrors retain existing revision-bound key summaries, but do not regenerate them from compact body excerpts. Pruning removes canonical revision evidence blobs, so run a fully hydrated sync in a writable archive before `summarize`; the summary queue requires the exact content-addressed payload bound to the revision.
 
@@ -117,6 +117,108 @@ Portable mirrors retain existing revision-bound key summaries, but do not regene
 | `--json` | _(off)_ | JSON output |
 
 After pruning, commit and push both the database and its `.manifest.json` from the portable checkout the way you would for any Git repository.
+
+## Derived generations: `gitcrawl portable export`
+
+`portable export` creates a new, validated database-and-manifest generation from
+the configured active database without changing that database. It is generic
+artifact production: Gitcrawl owns the consistent SQLite snapshot, semantic
+shaping, validation, size budget, digest, and manifest. Promotion into a
+repository, replacement of an older generation, Git commits, and publication
+remain external operations.
+
+The initial snapshot uses SQLite's online backup API in bounded page chunks, so
+committed WAL state is captured consistently and cancellation can be observed
+between chunks without compacting the multi-gigabyte source first.
+The private working copy disables journaling, synchronous writes, and secure
+deletion because it is never exposed and is deleted on any error. Privacy and
+durability come from the separate compact generation, full validation, hashing,
+fsync, and atomic directory commit.
+
+```bash
+gitcrawl --config /path/to/config.toml portable export \
+  --profile current-state-v1 \
+  --body-chars 32 \
+  --output-dir /path/to/artifact.next \
+  --database-name openclaw__openclaw.sync.db \
+  --public-path data/openclaw__openclaw.sync.db \
+  --repository openclaw/openclaw \
+  --max-bytes 99999999 \
+  --json
+```
+
+The required `--profile` currently accepts only `current-state-v1`.
+`--output-dir` is also required and must not exist; export builds beside it and
+renames the complete pair into place only after validation. The database name
+defaults to `gitcrawl.db` and must be a safe basename. `--public-path` defaults
+to that name and is a clean relative slash path recorded in the manifest and
+`portable_metadata`; it is a logical consumer path, never the source or output
+host path. `--body-chars` defaults to `256`. `--max-bytes` is optional and
+inclusive, so a deployment requiring a database smaller than 100,000,000 bytes
+should pass `99999999` rather than relying on a Gitcrawl-specific hosting limit.
+The optional `--repository owner/repo` is semantic export behavior: Gitcrawl
+removes all other repositories and their dependent rows from the disposable
+snapshot, verifies the exact remaining identity, and records it in the manifest.
+Without the flag, multi-repository artifacts remain supported.
+The manifest reports every retained table as a sorted `{name, rows}` object.
+It includes a singular repository object for scoped exports and for unscoped
+artifacts that naturally contain exactly one repository; multi-repository
+artifacts omit that singular field.
+
+The `current-state-v1` profile starts with portable v2 shaping and keeps current
+repositories, issue and pull-request threads, current comments, compact thread
+revisions and fingerprints, pull-request detail/review/check state, workflow
+runs, and child observation memberships. It omits comment revision history,
+generated thread key summaries, and derived cluster groups, memberships,
+lineage, overrides, and closures. PR file identity and change counts remain,
+while `pull_request_files.patch` diff payloads are set to `NULL`. It also removes ordinary non-unique indexes
+while retaining primary keys, unique constraints, and explicit unique indexes.
+The manifest records the exact dropped tables and indexes.
+
+Derived exports record `column_profile=sanitized-compatibility` in SQLite
+metadata and `columnProfile: sanitized-compatibility` in the manifest. They keep
+the full-schema compatibility columns `repositories.raw_json`,
+`threads.raw_json`, and `threads.body` to avoid three full-table SQLite rewrites;
+the raw JSON values are empty and `threads.body` contains only `body_excerpt`.
+Export rebuilds `threads` once from its stored constrained table definition,
+preserving table constraints, explicit unique indexes, triggers, child foreign
+keys, and all other columns while omitting ordinary transport indexes. Custom
+INSERT/DELETE triggers are retained; unsupported custom UPDATE-trigger semantics
+fail closed rather than silently diverging during the bulk copy.
+The final `VACUUM INTO` ensures the removed full payload bytes are absent. The
+portable schema identifier remains `gitcrawl-portable-sync-v2`, and ordinary
+`portable prune` continues to physically drop these columns.
+
+Those history and governance omissions are intentional data loss in the
+generation, not a promise that every omission can be rebuilt. Opening the
+export writable lets the current Gitcrawl migration recreate missing tables and
+ordinary schema indexes, but the omitted historical snapshots, summaries, and
+local maintainer decisions do not return. Rebuildable derived state may be
+generated again from the retained current data where the relevant command
+supports it.
+
+Before removing transport-only indexes, export requires an empty
+`foreign_key_check` while those indexes still make relationship proof efficient.
+It then creates one compact final generation with `VACUUM INTO`, closes and
+removes the larger private working database, and promotes the compact file
+within staging. The compact file must pass `quick_check` and full
+`integrity_check`; export then enforces the optional finalized byte
+budget, hashes the database with SHA-256, writes and fsyncs the manifest, then
+re-reads the pair without repeating the unindexed foreign-key scan. Concise
+stage progress is written to stderr, including during JSON output. Any failure
+or handled interrupt leaves the requested output directory absent and removes
+the private staging directory.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--profile <name>` | _(required)_ | Semantic export profile; currently `current-state-v1` |
+| `--output-dir <path>` | _(required)_ | New artifact directory; must not already exist |
+| `--database-name <name>` | `gitcrawl.db` | Safe database basename inside the generation |
+| `--public-path <path>` | database name | Logical relative slash path recorded in metadata and the manifest |
+| `--repository <owner/repo>` | _(unset)_ | Semantically restrict the artifact to exactly one repository |
+| `--body-chars <n>` | `256` | Maximum body characters retained in compact excerpts |
+| `--max-bytes <n>` | _(unset)_ | Inclusive maximum finalized database size |
+| `--json` | _(off)_ | Stable structured result, including local source and output paths |
 
 ## A typical publishing flow
 
