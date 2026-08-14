@@ -607,6 +607,63 @@ func TestExportGzipUsesArchiveBudgetAndCommitsManifestBackedArchive(t *testing.T
 	assertNoExportTemps(t, dir)
 }
 
+func TestValidateGzipArchiveRejectsMismatchedMetadataAndContents(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.db")
+	archivePath := filepath.Join(dir, "source.db.gz")
+	contents := bytes.Repeat([]byte("portable sqlite payload"), 32)
+	if err := os.WriteFile(sourcePath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGzipArchive(sourcePath, archivePath); err != nil {
+		t.Fatalf("write gzip archive: %v", err)
+	}
+	archiveInfo, err := os.Stat(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentsSHA := sha256.Sum256(contents)
+	archiveSHA := hashFile(t, archivePath)
+	if err := validateGzipArchive(archivePath, archiveInfo.Size(), archiveSHA, int64(len(contents)), hex.EncodeToString(contentsSHA[:])); err != nil {
+		t.Fatalf("validate gzip archive: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		archiveBytes int64
+		archiveSHA   string
+		outputBytes  int64
+		outputSHA    string
+		wantError    string
+	}{
+		{name: "archive size", archiveBytes: archiveInfo.Size() + 1, archiveSHA: archiveSHA, outputBytes: int64(len(contents)), outputSHA: hex.EncodeToString(contentsSHA[:]), wantError: "does not match archive size"},
+		{name: "archive sha", archiveBytes: archiveInfo.Size(), archiveSHA: strings.Repeat("0", 64), outputBytes: int64(len(contents)), outputSHA: hex.EncodeToString(contentsSHA[:]), wantError: "archiveSha256 does not match"},
+		{name: "expanded size", archiveBytes: archiveInfo.Size(), archiveSHA: archiveSHA, outputBytes: int64(len(contents)) - 1, outputSHA: hex.EncodeToString(contentsSHA[:]), wantError: "expected"},
+		{name: "expanded sha", archiveBytes: archiveInfo.Size(), archiveSHA: archiveSHA, outputBytes: int64(len(contents)), outputSHA: strings.Repeat("0", 64), wantError: "contents do not match"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateGzipArchive(archivePath, test.archiveBytes, test.archiveSHA, test.outputBytes, test.outputSHA)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("validateGzipArchive error = %v, want %q", err, test.wantError)
+			}
+		})
+	}
+
+	corruptPath := filepath.Join(dir, "corrupt.gz")
+	if err := os.WriteFile(corruptPath, []byte("not a gzip stream"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	corruptInfo, err := os.Stat(corruptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = validateGzipArchive(corruptPath, corruptInfo.Size(), hashFile(t, corruptPath), int64(len(contents)), hex.EncodeToString(contentsSHA[:]))
+	if err == nil || !strings.Contains(err.Error(), "open portable gzip stream") {
+		t.Fatalf("corrupt archive error = %v", err)
+	}
+}
+
 func TestExportRejectsUnsafeInputsAndExistingOutput(t *testing.T) {
 	for _, name := range []string{"", ".", "..", "a/b.db", `a\b.db`, "bad\x00.db", "bad?.db", "gitcrawl.db-wal", "gitcrawl.db-shm", "gitcrawl.db.manifest.json"} {
 		if err := ValidateDatabaseName(name); err == nil {
