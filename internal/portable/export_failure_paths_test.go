@@ -612,6 +612,25 @@ func TestExportRejectsInvalidSourcesBudgetsAndOutputParents(t *testing.T) {
 			wantError: "max-bytes must be a positive integer",
 		},
 		{
+			name: "unknown compression",
+			options: func() ExportOptions {
+				options := testExportOptions(validSource, filepath.Join(dir, "unknown-compression"))
+				options.Compression = "brotli"
+				return options
+			}(),
+			wantError: "unsupported compression",
+		},
+		{
+			name: "archive budget without compression",
+			options: func() ExportOptions {
+				options := testExportOptions(validSource, filepath.Join(dir, "archive-budget-without-compression"))
+				budget := int64(1)
+				options.MaxArchiveBytes = &budget
+				return options
+			}(),
+			wantError: "max-archive-bytes requires compression",
+		},
+		{
 			name:      "missing source",
 			options:   testExportOptions(filepath.Join(dir, "missing.db"), filepath.Join(dir, "missing-source")),
 			wantError: "stat source database",

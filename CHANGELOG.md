@@ -12,6 +12,7 @@ producing spuriously different exports.
 
 - Add streamlined `portable export` generations with single-pass sanitized compatibility tables and compact final files. Artifact identity now ignores explicit local ingestion churn while retaining exact SQLite SHA-256 integrity, so re-exporting unchanged data yields the same identity. Includes granular progress reporting and clean interruption handling.
 - Preserve the full schema in current-state exports, so a restored database matches the source structure rather than only its rows.
+- Let `portable export` atomically produce manifest-backed gzip generations with a separate archive byte budget, so growing portable databases stay publishable without moving compression into downstream scripts.
 
 ### Dependencies and maintenance
 
