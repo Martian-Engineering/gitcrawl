@@ -17,6 +17,7 @@ producing spuriously different exports.
 ### Dependencies and maintenance
 
 - Update Kong to v1.16.1.
+- Update the minimum Go toolchain to 1.26.6 for the latest standard-library security fixes.
 
 ## 0.9.0 - 2026-08-08
 
