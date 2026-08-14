@@ -1,6 +1,7 @@
 package portable
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -26,6 +27,7 @@ import (
 
 const (
 	CurrentStateV1        = "current-state-v1"
+	CompressionGzip       = "gzip"
 	portableSchema        = "gitcrawl-portable-sync-v2"
 	currentProfileVersion = 1
 	defaultBodyChars      = 256
@@ -105,15 +107,17 @@ func ResolveProfile(name string) (Profile, error) {
 }
 
 type ExportOptions struct {
-	SourceDBPath string
-	OutputDir    string
-	DatabaseName string
-	PublicPath   string
-	Profile      string
-	Repository   string
-	BodyChars    int
-	MaxBytes     *int64
-	Progress     ProgressFunc
+	SourceDBPath    string
+	OutputDir       string
+	DatabaseName    string
+	PublicPath      string
+	Profile         string
+	Repository      string
+	BodyChars       int
+	MaxBytes        *int64
+	Compression     string
+	MaxArchiveBytes *int64
+	Progress        ProgressFunc
 }
 
 type Stage string
@@ -127,6 +131,7 @@ const (
 	StageFinalVacuum      Stage = "final vacuum"
 	StageValidation       Stage = "validation"
 	StageArtifactIdentity Stage = "artifact identity"
+	StageCompression      Stage = "compression"
 	StageManifest         Stage = "manifest"
 	StageArtifactCommit   Stage = "artifact commit"
 	StageComplete         Stage = "complete"
@@ -169,6 +174,11 @@ type Manifest struct {
 	Repository           *Repository `json:"repository,omitempty"`
 	BodyChars            int         `json:"bodyChars"`
 	MaxBytes             *int64      `json:"maxBytes,omitempty"`
+	Compression          string      `json:"compression,omitempty"`
+	ArchivePath          string      `json:"archivePath,omitempty"`
+	ArchiveBytes         int64       `json:"archiveBytes,omitempty"`
+	ArchiveSHA256        string      `json:"archiveSha256,omitempty"`
+	MaxArchiveBytes      *int64      `json:"maxArchiveBytes,omitempty"`
 	Tables               []Table     `json:"tables"`
 	Excluded             []string    `json:"excluded"`
 	ValidationOK         bool        `json:"validationOk"`
@@ -196,6 +206,12 @@ type ExportResult struct {
 	BytesAfter           int64       `json:"bytes_after"`
 	MaxBytes             *int64      `json:"max_bytes,omitempty"`
 	ByteBudgetOK         bool        `json:"byte_budget_ok"`
+	Compression          string      `json:"compression,omitempty"`
+	ArchivePath          string      `json:"archive_path,omitempty"`
+	ArchiveBytes         int64       `json:"archive_bytes,omitempty"`
+	ArchiveSHA256        string      `json:"archive_sha256,omitempty"`
+	MaxArchiveBytes      *int64      `json:"max_archive_bytes,omitempty"`
+	ArchiveByteBudgetOK  bool        `json:"archive_byte_budget_ok"`
 	ArtifactID           string      `json:"artifact_id"`
 	ArtifactIDProfile    string      `json:"artifact_id_profile"`
 	SHA256               string      `json:"sha256"`
@@ -236,6 +252,17 @@ func (e exporter) export(ctx context.Context, options ExportOptions) (result Exp
 	if options.MaxBytes != nil && *options.MaxBytes <= 0 {
 		return result, fmt.Errorf("max-bytes must be a positive integer")
 	}
+	if options.Compression != "" && options.Compression != CompressionGzip {
+		return result, fmt.Errorf("unsupported compression %q; supported compression: %s", options.Compression, CompressionGzip)
+	}
+	if options.MaxArchiveBytes != nil {
+		if *options.MaxArchiveBytes <= 0 {
+			return result, fmt.Errorf("max-archive-bytes must be a positive integer")
+		}
+		if options.Compression == "" {
+			return result, fmt.Errorf("max-archive-bytes requires compression")
+		}
+	}
 	sourcePath, err := filepath.Abs(options.SourceDBPath)
 	if err != nil {
 		return result, fmt.Errorf("resolve source database path: %w", err)
@@ -270,20 +297,30 @@ func (e exporter) export(ctx context.Context, options ExportOptions) (result Exp
 	}()
 	dbPath := filepath.Join(stageDir, options.DatabaseName)
 	manifestPath := dbPath + ".manifest.json"
+	archivePath := ""
+	if options.Compression == CompressionGzip {
+		archivePath = dbPath + ".gz"
+	}
 	result = ExportResult{
-		Profile:        profile.Name,
-		PortableSchema: portableSchema,
-		Schema:         portableSchema,
-		SourceDBPath:   sourcePath,
-		OutputDir:      outputDir,
-		DatabasePath:   filepath.Join(outputDir, options.DatabaseName),
-		ManifestPath:   filepath.Join(outputDir, options.DatabaseName+".manifest.json"),
-		PublicPath:     options.PublicPath,
-		BodyChars:      options.BodyChars,
-		BytesBefore:    sourceInfo.Size(),
-		MaxBytes:       options.MaxBytes,
-		ByteBudgetOK:   true,
-		ColumnProfile:  profile.ColumnProfile,
+		Profile:             profile.Name,
+		PortableSchema:      portableSchema,
+		Schema:              portableSchema,
+		SourceDBPath:        sourcePath,
+		OutputDir:           outputDir,
+		DatabasePath:        filepath.Join(outputDir, options.DatabaseName),
+		ManifestPath:        filepath.Join(outputDir, options.DatabaseName+".manifest.json"),
+		PublicPath:          options.PublicPath,
+		BodyChars:           options.BodyChars,
+		BytesBefore:         sourceInfo.Size(),
+		MaxBytes:            options.MaxBytes,
+		ByteBudgetOK:        true,
+		Compression:         options.Compression,
+		MaxArchiveBytes:     options.MaxArchiveBytes,
+		ArchiveByteBudgetOK: true,
+		ColumnProfile:       profile.ColumnProfile,
+	}
+	if archivePath != "" {
+		result.ArchivePath = filepath.Join(outputDir, filepath.Base(archivePath))
 	}
 	if err := reportProgress(ctx, options.Progress, StageSnapshot); err != nil {
 		return result, err
@@ -488,6 +525,27 @@ func (e exporter) export(ctx context.Context, options ExportOptions) (result Exp
 	result.ArtifactID = artifactID
 	result.DroppedTables = droppedTables
 	result.DroppedIndexes = droppedIndexes
+	if options.Compression == CompressionGzip {
+		if err := reportProgress(ctx, options.Progress, StageCompression); err != nil {
+			return result, err
+		}
+		if err := writeGzipArchive(dbPath, archivePath); err != nil {
+			return result, fmt.Errorf("compress portable database: %w", err)
+		}
+		archiveInfo, err := os.Stat(archivePath)
+		if err != nil {
+			return result, fmt.Errorf("stat portable archive: %w", err)
+		}
+		result.ArchiveBytes = archiveInfo.Size()
+		if options.MaxArchiveBytes != nil && archiveInfo.Size() > *options.MaxArchiveBytes {
+			result.ArchiveByteBudgetOK = false
+			return result, fmt.Errorf("portable archive size %d exceeds max-archive-bytes %d", archiveInfo.Size(), *options.MaxArchiveBytes)
+		}
+		result.ArchiveSHA256, err = fileSHA256(archivePath)
+		if err != nil {
+			return result, fmt.Errorf("hash portable archive: %w", err)
+		}
+	}
 	if err := reportProgress(ctx, options.Progress, StageManifest); err != nil {
 		return result, err
 	}
@@ -505,6 +563,10 @@ func (e exporter) export(ctx context.Context, options ExportOptions) (result Exp
 		Repository:           result.Repository,
 		BodyChars:            options.BodyChars,
 		MaxBytes:             options.MaxBytes,
+		Compression:          options.Compression,
+		ArchiveBytes:         result.ArchiveBytes,
+		ArchiveSHA256:        result.ArchiveSHA256,
+		MaxArchiveBytes:      options.MaxArchiveBytes,
 		Tables:               tables,
 		Excluded:             append([]string(nil), profile.Excluded...),
 		ValidationOK:         true,
@@ -515,6 +577,9 @@ func (e exporter) export(ctx context.Context, options ExportOptions) (result Exp
 		DroppedIndexes:       droppedIndexes,
 		IndexProfile:         profile.IndexProfile,
 		ColumnProfile:        profile.ColumnProfile,
+	}
+	if archivePath != "" {
+		manifest.ArchivePath = filepath.Base(archivePath)
 	}
 	if e.beforeManifest != nil {
 		if err := e.beforeManifest(); err != nil {
@@ -531,6 +596,11 @@ func (e exporter) export(ctx context.Context, options ExportOptions) (result Exp
 	if err := syncRegularFile(dbPath); err != nil {
 		return result, fmt.Errorf("sync portable database: %w", err)
 	}
+	if archivePath != "" {
+		if err := syncRegularFile(archivePath); err != nil {
+			return result, fmt.Errorf("sync portable archive: %w", err)
+		}
+	}
 	if err := validateManifestPair(ctx, dbPath, manifestPath, manifest); err != nil {
 		return result, err
 	}
@@ -541,6 +611,11 @@ func (e exporter) export(ctx context.Context, options ExportOptions) (result Exp
 		return result, fmt.Errorf("re-hash portable database after validation: %w", err)
 	} else if finalSHA != sha {
 		return result, fmt.Errorf("portable database changed during manifest validation")
+	}
+	if archivePath != "" {
+		if err := os.Remove(dbPath); err != nil {
+			return result, fmt.Errorf("remove unpackaged portable database: %w", err)
+		}
 	}
 	bestEffortSyncDir(stageDir)
 	if e.beforeCommit != nil {
@@ -995,6 +1070,85 @@ func fileSHA256(filePath string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
+func writeGzipArchive(sourcePath, archivePath string) (retErr error) {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	archive, err := os.OpenFile(archivePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	complete := false
+	defer func() {
+		if closeErr := archive.Close(); closeErr != nil {
+			retErr = errors.Join(retErr, closeErr)
+		}
+		if !complete {
+			_ = os.Remove(archivePath)
+		}
+	}()
+	writer, err := gzip.NewWriterLevel(archive, gzip.BestCompression)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(writer, source); err != nil {
+		_ = writer.Close()
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	if err := archive.Sync(); err != nil {
+		return err
+	}
+	complete = true
+	return nil
+}
+
+func validateGzipArchive(archivePath string, expectedArchiveBytes int64, expectedArchiveSHA string, expectedOutputBytes int64, expectedOutputSHA string) error {
+	info, err := os.Stat(archivePath)
+	if err != nil {
+		return fmt.Errorf("re-stat portable archive: %w", err)
+	}
+	if info.Size() != expectedArchiveBytes {
+		return fmt.Errorf("portable manifest archiveBytes %d does not match archive size %d", expectedArchiveBytes, info.Size())
+	}
+	archiveSHA, err := fileSHA256(archivePath)
+	if err != nil {
+		return fmt.Errorf("re-hash portable archive: %w", err)
+	}
+	if archiveSHA != expectedArchiveSHA {
+		return fmt.Errorf("portable manifest archiveSha256 does not match archive")
+	}
+	archive, err := os.Open(archivePath)
+	if err != nil {
+		return fmt.Errorf("open portable archive: %w", err)
+	}
+	defer archive.Close()
+	reader, err := gzip.NewReader(archive)
+	if err != nil {
+		return fmt.Errorf("open portable gzip stream: %w", err)
+	}
+	hash := sha256.New()
+	written, copyErr := io.Copy(hash, io.LimitReader(reader, expectedOutputBytes+1))
+	closeErr := reader.Close()
+	if copyErr != nil {
+		return fmt.Errorf("read portable gzip stream: %w", copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close portable gzip stream: %w", closeErr)
+	}
+	if written != expectedOutputBytes {
+		return fmt.Errorf("portable archive expands to %d bytes, expected %d", written, expectedOutputBytes)
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != expectedOutputSHA {
+		return fmt.Errorf("portable archive contents do not match database sha256")
+	}
+	return nil
+}
+
 func writeSyncedFile(filePath string, data []byte, mode os.FileMode) error {
 	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
@@ -1077,6 +1231,20 @@ func validateManifestPair(ctx context.Context, dbPath, manifestPath string, expe
 	}
 	if sha != actual.SHA256 {
 		return fmt.Errorf("portable manifest sha256 does not match database")
+	}
+	if actual.Compression != "" {
+		if actual.Compression != CompressionGzip {
+			return fmt.Errorf("portable manifest compression %q is unsupported", actual.Compression)
+		}
+		if actual.ArchivePath == "" || filepath.Base(actual.ArchivePath) != actual.ArchivePath {
+			return fmt.Errorf("portable manifest archivePath must be a basename")
+		}
+		if actual.ArchiveBytes <= 0 || actual.ArchiveSHA256 == "" {
+			return fmt.Errorf("portable manifest archive metadata is incomplete")
+		}
+		if err := validateGzipArchive(filepath.Join(filepath.Dir(manifestPath), actual.ArchivePath), actual.ArchiveBytes, actual.ArchiveSHA256, actual.OutputBytes, actual.SHA256); err != nil {
+			return err
+		}
 	}
 	if actual.Profile != CurrentStateV1 {
 		return fmt.Errorf("portable manifest profile %q does not support semantic artifact identity", actual.Profile)

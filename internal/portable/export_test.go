@@ -2,12 +2,14 @@ package portable
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -526,6 +528,81 @@ func TestExportByteBudgetExactAndOneByteOver(t *testing.T) {
 	}
 	if _, err := os.Stat(failingDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed budget left target: %v", err)
+	}
+	assertNoExportTemps(t, dir)
+}
+
+func TestExportGzipUsesArchiveBudgetAndCommitsManifestBackedArchive(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.db")
+	st := seedExportSource(t, ctx, sourcePath)
+	defer st.Close()
+
+	baseline, err := Export(ctx, testExportOptions(sourcePath, filepath.Join(dir, "baseline")))
+	if err != nil {
+		t.Fatalf("baseline export: %v", err)
+	}
+	archiveBudget := baseline.BytesAfter - 1
+	options := testExportOptions(sourcePath, filepath.Join(dir, "compressed"))
+	options.Compression = CompressionGzip
+	options.MaxArchiveBytes = &archiveBudget
+	compressed, err := Export(ctx, options)
+	if err != nil {
+		t.Fatalf("compressed export under archive budget: %v", err)
+	}
+	if compressed.Compression != CompressionGzip || !compressed.ArchiveByteBudgetOK || compressed.ArchiveBytes <= 0 || compressed.ArchiveBytes > archiveBudget {
+		t.Fatalf("compressed result = %+v", compressed)
+	}
+	if _, err := os.Stat(compressed.DatabasePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("compressed export retained raw database: %v", err)
+	}
+	if _, err := os.Stat(compressed.ArchivePath); err != nil {
+		t.Fatalf("compressed archive missing: %v", err)
+	}
+	manifest := readManifest(t, compressed.ManifestPath)
+	if manifest.Compression != CompressionGzip || manifest.ArchivePath != filepath.Base(compressed.ArchivePath) ||
+		manifest.ArchiveBytes != compressed.ArchiveBytes || manifest.ArchiveSHA256 != compressed.ArchiveSHA256 ||
+		manifest.MaxArchiveBytes == nil || *manifest.MaxArchiveBytes != archiveBudget {
+		t.Fatalf("compressed manifest/result mismatch: manifest=%+v result=%+v", manifest, compressed)
+	}
+	archive, err := os.Open(compressed.ArchivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := gzip.NewReader(archive)
+	if err != nil {
+		archive.Close()
+		t.Fatal(err)
+	}
+	unpackedPath := filepath.Join(dir, "unpacked.db")
+	unpacked, err := os.Create(unpackedPath)
+	if err != nil {
+		reader.Close()
+		archive.Close()
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(unpacked, reader); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(unpacked.Close(), reader.Close(), archive.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if got := hashFile(t, unpackedPath); got != compressed.SHA256 {
+		t.Fatalf("unpacked database hash = %s, want %s", got, compressed.SHA256)
+	}
+
+	tooSmall := compressed.ArchiveBytes - 1
+	failingDir := filepath.Join(dir, "too-large")
+	failingOptions := testExportOptions(sourcePath, failingDir)
+	failingOptions.Compression = CompressionGzip
+	failingOptions.MaxArchiveBytes = &tooSmall
+	failed, err := Export(ctx, failingOptions)
+	if err == nil || !strings.Contains(err.Error(), "exceeds max-archive-bytes") || failed.ArchiveByteBudgetOK {
+		t.Fatalf("archive over budget result=%+v err=%v", failed, err)
+	}
+	if _, err := os.Stat(failingDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed archive budget left target: %v", err)
 	}
 	assertNoExportTemps(t, dir)
 }

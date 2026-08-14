@@ -4836,7 +4836,8 @@ func TestPortableExportCommandCreatesCurrentStateGenerationFromLiveWAL(t *testin
 		"--database-name", "openclaw__openclaw.sync.db",
 		"--public-path", "data/openclaw__openclaw.sync.db",
 		"--repository", "openclaw/openclaw",
-		"--max-bytes", "99999999",
+		"--compression", "gzip",
+		"--max-archive-bytes", "99999999",
 		"--json",
 	}); err != nil {
 		t.Fatalf("portable export: %v", err)
@@ -4857,7 +4858,11 @@ func TestPortableExportCommandCreatesCurrentStateGenerationFromLiveWAL(t *testin
 		} `json:"repository"`
 		BodyChars            int    `json:"body_chars"`
 		BytesAfter           int64  `json:"bytes_after"`
-		MaxBytes             int64  `json:"max_bytes"`
+		Compression          string `json:"compression"`
+		ArchivePath          string `json:"archive_path"`
+		ArchiveBytes         int64  `json:"archive_bytes"`
+		MaxArchiveBytes      int64  `json:"max_archive_bytes"`
+		ArchiveByteBudgetOK  bool   `json:"archive_byte_budget_ok"`
 		ArtifactID           string `json:"artifact_id"`
 		ArtifactIDProfile    string `json:"artifact_id_profile"`
 		SHA256               string `json:"sha256"`
@@ -4873,13 +4878,25 @@ func TestPortableExportCommandCreatesCurrentStateGenerationFromLiveWAL(t *testin
 	if payload.Profile != "current-state-v1" || payload.PortableSchema != "gitcrawl-portable-sync-v2" ||
 		payload.SourceDBPath != dbPath || payload.OutputDir != outputDir || payload.PublicPath != "data/openclaw__openclaw.sync.db" ||
 		payload.Repository.Owner != "openclaw" || payload.Repository.Name != "openclaw" || payload.Repository.FullName != "openclaw/openclaw" ||
-		payload.BodyChars != 32 || payload.MaxBytes != 99999999 || payload.BytesAfter <= 0 || payload.ArtifactID == payload.SHA256 ||
+		payload.BodyChars != 32 || payload.Compression != "gzip" || payload.ArchiveBytes <= 0 || payload.MaxArchiveBytes != 99999999 || !payload.ArchiveByteBudgetOK ||
+		payload.BytesAfter <= 0 || payload.ArtifactID == payload.SHA256 ||
 		payload.ArtifactIDProfile != portableexport.CurrentStateSemanticV1 ||
 		payload.QuickCheck != "ok" || payload.IntegrityCheck != "ok" || payload.ForeignKeyViolations != 0 || !payload.ArtifactCommitted ||
 		payload.ColumnProfile != store.PortableColumnProfileSanitizedCompatibility {
 		t.Fatalf("portable export payload = %+v", payload)
 	}
-	artifact, err := sql.Open("sqlite", payload.DatabasePath)
+	if _, err := os.Stat(payload.DatabasePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("compressed export retained raw database: %v", err)
+	}
+	if _, err := os.Stat(payload.ArchivePath); err != nil {
+		t.Fatalf("compressed export archive missing: %v", err)
+	}
+	materializedPath, err := stagePortableSQLiteSourceTemp(payload.DatabasePath, filepath.Join(dir, "materialized.db"), 0o600)
+	if err != nil {
+		t.Fatalf("materialize compressed export through portable reader: %v", err)
+	}
+	defer os.Remove(materializedPath)
+	artifact, err := sql.Open("sqlite", materializedPath)
 	if err != nil {
 		t.Fatalf("open artifact: %v", err)
 	}
@@ -4911,7 +4928,7 @@ func TestPortableExportCommandCreatesCurrentStateGenerationFromLiveWAL(t *testin
 		"canonical shaping: threads rebuild: compact copy",
 		"canonical shaping: threads rebuild: schema swap",
 		"canonical shaping: threads rebuild: schema restore",
-		"index removal", "final vacuum", "validation", "artifact identity", "manifest", "artifact commit", "complete",
+		"index removal", "final vacuum", "validation", "artifact identity", "compression", "manifest", "artifact commit", "complete",
 	} {
 		prefix := "gitcrawl: portable export: stage=" + stage + " "
 		var progressLine string
@@ -4952,6 +4969,20 @@ func TestPortableExportCommandValidatesProfileBeforeOpeningSource(t *testing.T) 
 	})
 	if err == nil || !strings.Contains(err.Error(), `repository: expected owner/repo, got "openclaw /gitcrawl"`) {
 		t.Fatalf("non-canonical repository error = %v", err)
+	}
+	err = app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "current-state-v1", "--output-dir", filepath.Join(t.TempDir(), "out"), "--compression", "brotli",
+	})
+	if err == nil || !strings.Contains(err.Error(), `--compression must be "gzip"`) {
+		t.Fatalf("unsupported compression error = %v", err)
+	}
+	err = app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "current-state-v1", "--output-dir", filepath.Join(t.TempDir(), "out"), "--max-archive-bytes", "99999999",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--max-archive-bytes requires --compression") {
+		t.Fatalf("archive budget without compression error = %v", err)
 	}
 }
 

@@ -3441,10 +3441,13 @@ func (a *App) runPortableExport(ctx context.Context, args []string) error {
 	publicPath := fs.String("public-path", "", "logical portable database path")
 	repositoryRaw := fs.String("repository", "", "restrict the artifact to one owner/repo")
 	maxBytesRaw := fs.String("max-bytes", "", "maximum finalized database bytes")
+	compression := fs.String("compression", "", "artifact compression (gzip)")
+	maxArchiveBytesRaw := fs.String("max-archive-bytes", "", "maximum finalized archive bytes")
 	jsonOut := fs.Bool("json", false, "write JSON output")
 	valueFlags := map[string]bool{
 		"profile": true, "body-chars": true, "output-dir": true,
 		"database-name": true, "public-path": true, "repository": true, "max-bytes": true,
+		"compression": true, "max-archive-bytes": true,
 	}
 	if err := fs.Parse(normalizeCommandArgs(args, valueFlags)); err != nil {
 		return usageErr(err)
@@ -3473,6 +3476,20 @@ func (a *App) runPortableExport(ctx context.Context, args []string) error {
 			return usageErr(fmt.Errorf("--max-bytes must be a positive integer"))
 		}
 		maxBytes = &parsed
+	}
+	var maxArchiveBytes *int64
+	if strings.TrimSpace(*maxArchiveBytesRaw) != "" {
+		parsed, err := strconv.ParseInt(strings.TrimSpace(*maxArchiveBytesRaw), 10, 64)
+		if err != nil || parsed <= 0 {
+			return usageErr(fmt.Errorf("--max-archive-bytes must be a positive integer"))
+		}
+		maxArchiveBytes = &parsed
+	}
+	if *compression != "" && *compression != portableexport.CompressionGzip {
+		return usageErr(fmt.Errorf("--compression must be %q", portableexport.CompressionGzip))
+	}
+	if maxArchiveBytes != nil && *compression == "" {
+		return usageErr(fmt.Errorf("--max-archive-bytes requires --compression"))
 	}
 	logicalPath := *publicPath
 	if logicalPath == "" {
@@ -3509,14 +3526,16 @@ func (a *App) runPortableExport(ctx context.Context, args []string) error {
 	progressStarted := time.Now()
 	progressPrevious := progressStarted
 	result, err := portableexport.Export(ctx, portableexport.ExportOptions{
-		SourceDBPath: sourceDBPath,
-		OutputDir:    *outputDir,
-		DatabaseName: *databaseName,
-		PublicPath:   logicalPath,
-		Profile:      *profile,
-		Repository:   repository,
-		BodyChars:    bodyChars,
-		MaxBytes:     maxBytes,
+		SourceDBPath:    sourceDBPath,
+		OutputDir:       *outputDir,
+		DatabaseName:    *databaseName,
+		PublicPath:      logicalPath,
+		Profile:         *profile,
+		Repository:      repository,
+		BodyChars:       bodyChars,
+		MaxBytes:        maxBytes,
+		Compression:     *compression,
+		MaxArchiveBytes: maxArchiveBytes,
 		Progress: func(stage portableexport.Stage) {
 			now := time.Now()
 			fmt.Fprintf(
@@ -5510,7 +5529,7 @@ const portableUsageText = `gitcrawl portable manages local portable-store snapsh
 
 Usage:
   gitcrawl portable prune [--body-chars N] [--no-vacuum] [--include-sync-failures] [--no-publish] [--json]
-  gitcrawl portable export --profile current-state-v1 --output-dir PATH [--repository owner/repo] [--database-name NAME] [--public-path PATH] [--body-chars N] [--max-bytes N] [--json]
+  gitcrawl portable export --profile current-state-v1 --output-dir PATH [--repository owner/repo] [--database-name NAME] [--public-path PATH] [--body-chars N] [--max-bytes N] [--compression gzip] [--max-archive-bytes N] [--json]
 
 Subcommands:
   prune               prune volatile payloads from the configured portable store
@@ -5523,5 +5542,7 @@ For a portable checkout, prune publishes the database and manifest back into
 the checkout by default. --no-publish leaves them only in the runtime mirror.
 Export never changes the active database or publishes the artifact. It creates
 a complete database and manifest generation at a previously nonexistent path.
+With --compression gzip, it commits the gzip archive and manifest without the
+uncompressed database; --max-archive-bytes applies to that published archive.
 --repository semantically restricts the disposable snapshot to one owner/repo.
 `

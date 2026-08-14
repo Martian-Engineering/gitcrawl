@@ -143,7 +143,8 @@ gitcrawl --config /path/to/config.toml portable export \
   --database-name openclaw__openclaw.sync.db \
   --public-path data/openclaw__openclaw.sync.db \
   --repository openclaw/openclaw \
-  --max-bytes 99999999 \
+  --compression gzip \
+  --max-archive-bytes 99999999 \
   --json
 ```
 
@@ -153,9 +154,11 @@ renames the complete pair into place only after validation. The database name
 defaults to `gitcrawl.db` and must be a safe basename. `--public-path` defaults
 to that name and is a clean relative slash path recorded in the manifest and
 `portable_metadata`; it is a logical consumer path, never the source or output
-host path. `--body-chars` defaults to `256`. `--max-bytes` is optional and
-inclusive, so a deployment requiring a database smaller than 100,000,000 bytes
-should pass `99999999` rather than relying on a Gitcrawl-specific hosting limit.
+host path. `--body-chars` defaults to `256`. `--max-bytes` is an optional,
+inclusive limit for raw database generations. `--compression gzip` instead
+commits only the gzip archive and manifest in the generation. Pair it with
+`--max-archive-bytes`; a Git host requiring an artifact smaller than
+100,000,000 bytes should pass `99999999`.
 The optional `--repository owner/repo` is semantic export behavior: Gitcrawl
 removes all other repositories and their dependent rows from the disposable
 snapshot, verifies the exact remaining identity, and records it in the manifest.
@@ -174,6 +177,10 @@ normalized compact copy and is identified by
 `artifact_id_profile`). Publishers should use `artifactId` for no-op decisions
 and `sha256` for file integrity: repeated ingestion may legitimately change the
 file SHA while retaining the same meaningful portable state.
+For gzip generations, the manifest also records `compression`, `archivePath`,
+`archiveBytes`, `archiveSha256`, and `maxArchiveBytes`. Gitcrawl validates the
+archive against both compressed and expanded identities before atomically
+committing the generation.
 Destructive `portable prune` continues to record its operation time as
 `portable_metadata.exported_at`.
 
