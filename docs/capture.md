@@ -66,8 +66,12 @@ Each thread contains its stable GitHub ID, number, kind, state, title, body,
 author, URL, labels, assignees, timestamps, comments, and semantic
 `content_hash`. Comments are ordered by source time, kind, and stable ID.
 
-The semantic hash covers the exported thread before `content_hash` is set. It
-changes when exported thread or comment content changes.
+The semantic hash covers the exported thread before `content_hash` is set,
+except for the thread's top-level GitHub `updated_at`. GitHub may advance that
+timeline envelope timestamp for changes outside the capture, such as deleting
+a merged pull request's head branch. The timestamp remains in the export for
+incremental discovery and audit, while thread or comment content changes still
+change the semantic hash.
 
 Repository metadata, sync metadata, threads, and comments are read from one
 SQLite transaction so a concurrent sync cannot mix archive generations in one

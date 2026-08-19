@@ -188,6 +188,90 @@ func testRateLimit() RateLimit {
 	}
 }
 
+func TestSemanticThreadHashIgnoresTimelineOnlyUpdates(t *testing.T) {
+	thread := Thread{
+		CanonicalID: "PR_97",
+		Number:      97,
+		Kind:        "pull_request",
+		State:       "closed",
+		Title:       "Add Slack dashboard slash commands",
+		Body:        "The merged pull request body.",
+		URL:         "https://github.com/openclaw/gitcrawl/pull/97",
+		Labels:      []string{},
+		Assignees:   []string{},
+		CreatedAt:   "2026-07-07T18:13:21Z",
+		UpdatedAt:   "2026-07-07T18:31:54Z",
+		ClosedAt:    "2026-07-07T18:31:54Z",
+		MergedAt:    "2026-07-07T18:31:54Z",
+		Comments: []Comment{{
+			ID: "4907053135", Kind: "issue_comment", Body: "Ready",
+			CreatedAt: "2026-07-07T18:13:28Z",
+			UpdatedAt: "2026-07-07T18:26:08Z",
+		}},
+	}
+	original, err := semanticThreadHash(thread)
+	if err != nil {
+		t.Fatalf("hash original thread: %v", err)
+	}
+
+	thread.UpdatedAt = "2026-08-19T18:30:28Z"
+	afterHeadRefDeletion, err := semanticThreadHash(thread)
+	if err != nil {
+		t.Fatalf("hash head-ref deletion observation: %v", err)
+	}
+	if afterHeadRefDeletion != original {
+		t.Fatalf("timeline-only update changed semantic hash: %s != %s", afterHeadRefDeletion, original)
+	}
+
+	thread.Comments[0].Body = "Changed review evidence"
+	afterCommentChange, err := semanticThreadHash(thread)
+	if err != nil {
+		t.Fatalf("hash comment change: %v", err)
+	}
+	if afterCommentChange == original {
+		t.Fatal("semantic comment change retained the original hash")
+	}
+}
+
+func TestSemanticThreadHashMatchesCaptureV1ConsumerFixture(t *testing.T) {
+	thread := Thread{
+		CanonicalID:       "PR_kwDO456",
+		Number:            8,
+		Kind:              "pull_request",
+		State:             "closed",
+		Title:             "Improve docs",
+		Body:              "Explains behavior",
+		AuthorLogin:       "josh",
+		AuthorType:        "User",
+		AuthorAssociation: "MEMBER",
+		URL:               "https://github.com/acme/widgets/pull/8",
+		Labels:            []string{"documentation"},
+		Assignees:         []string{},
+		CreatedAt:         "2026-07-02T10:00:00Z",
+		UpdatedAt:         "2026-07-30T20:30:00Z",
+		ClosedAt:          "2026-07-30T20:30:00Z",
+		MergedAt:          "2026-07-30T20:30:00Z",
+		Comments: []Comment{{
+			ID: "PRR_1", Kind: "pull_review", AuthorLogin: "reviewer",
+			AuthorType: "User", Body: "Approved overall", ReviewState: "APPROVED",
+			CreatedAt: "2026-07-30T19:00:00Z",
+		}, {
+			ID: "PRRC_1", Kind: "pull_review_comment", AuthorLogin: "reviewer",
+			AuthorType: "User", Body: "Clarify this paragraph",
+			CreatedAt: "2026-07-30T19:05:00Z", UpdatedAt: "2026-07-30T19:06:00Z",
+		}},
+	}
+
+	got, err := semanticThreadHash(thread)
+	if err != nil {
+		t.Fatalf("hash consumer fixture: %v", err)
+	}
+	const want = "4b180852e896b32dc2ea881405079b50b054d1c9d80a6f6c6acd3b573cb2b7d4"
+	if got != want {
+		t.Fatalf("capture v1 consumer hash = %s, want %s", got, want)
+	}
+}
+
 func TestBuildRequiresStableRepositoryIdentityAndSuccessfulSync(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))

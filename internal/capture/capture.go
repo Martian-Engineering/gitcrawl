@@ -386,13 +386,25 @@ func buildThread(
 		MergedAt:          mergedAt,
 		Comments:          capturedComments,
 	}
+	thread.ContentHash, err = semanticThreadHash(thread)
+	if err != nil {
+		return Thread{}, fmt.Errorf("hash thread #%d capture: %w", stored.Number, err)
+	}
+	return thread, nil
+}
+
+// semanticThreadHash excludes GitHub's timeline envelope timestamp.
+// UpdatedAt still drives incremental discovery, while the remaining thread
+// and comment fields decide whether consumers receive a new revision.
+func semanticThreadHash(thread Thread) (string, error) {
+	thread.UpdatedAt = ""
+	thread.ContentHash = ""
 	semantic, err := json.Marshal(thread)
 	if err != nil {
-		return Thread{}, fmt.Errorf("marshal thread #%d capture: %w", stored.Number, err)
+		return "", err
 	}
 	sum := sha256.Sum256(semantic)
-	thread.ContentHash = hex.EncodeToString(sum[:])
-	return thread, nil
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // sameInstant compares source timestamps after strict RFC3339 parsing.
